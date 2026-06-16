@@ -149,7 +149,7 @@ docker run --rm -it --gpus all \
 The public release ships `data/instance_tree.json` for each sample but not the
 builder that produces it. This fork reconstructs that builder from the paper in
 `clutt3rseg/tree_builder.py` (+ `clutt3rseg/scene_substrate.py`), following
-Algorithm 1: per-frame 2D containment forests select proper-segment *leaf* masks
+Algorithm 1: per-frame 2D containment forests select proper-segment _leaf_ masks
 (`phi`), which form the vertices of a complete graph over **cross-frame** leaf
 pairs (`phi(u) != phi(v)`); the graph is contracted greedily by **average
 linkage** (`GroupAndRewire`, the new edge weight is the mean similarity over all
@@ -187,7 +187,7 @@ builder, then the segmenter.
 
 ### Measured (non-dense) depth
 
-The paper uses dense MVSAnywhere depth; the consumer originally *required* it
+The paper uses dense MVSAnywhere depth; the consumer originally _required_ it
 (it raised on any invalid pixel). That check is **loosened** to a warning so the
 baseline runs on the same measured/sensor depth as the other baselines:
 back-projection keeps only valid pixels, holes are mapped to -1 and filtered with
@@ -215,10 +215,10 @@ dataset (per-frame `K`, OpenGL poses, `depth_path`) rather than the clutt3r samp
 layout, `clutt3rseg/deg_adapter.py` materialises a temp `data/` workspace from the
 deg observations, handling the two real differences:
 
-* **Convention** — deg poses are OpenGL/NeRF; each is converted to OpenCV
+- **Convention** — deg poses are OpenGL/NeRF; each is converted to OpenCV
   cam-to-world (`T_cv = X_WV @ diag(1,-1,-1,1)`, verified against
   `psdframe.Frame.X_VW_opencv`).
-* **Per-frame intrinsics** — deg datasets are often multi-camera rigs with a
+- **Per-frame intrinsics** — deg datasets are often multi-camera rigs with a
   different `K` per frame; intrinsics are now resolved per frame everywhere
   (`utils.K_from_meta`), not assumed shared.
 
@@ -227,14 +227,31 @@ deg observations, handling the two real differences:
 pixi run --frozen segment_external datasets/graspnet-mvseg/scene_0124/transforms.json scene.pkl
 ```
 
-Quality depends on depth registration. On **graspnet** (clean, depth-color-aligned,
-~5% holes) cross-view spatial grouping works well (e.g. scene_0124: 66 leaves →
-18 instances with 23 spatial merges → 11 after filtering). On **deg-ds** (real
-multi-cam, 12–23% holes, cm-level registration error) the same-object points from
-different views fall into different 5 mm super-voxels, so spatial overlap collapses
-(`spatial=0`) and the scene over-segments — clutt3r-seg relies on the dense,
-consistent depth the paper assumes. For such data raise `--voxel-size` (≈0.02–0.03
-restores cross-view Jaccard) and/or use `--variant improved`.
+The second positional is the deg `SceneSetup` pickle, which the parity filters
+below consume (the native clutt3r samples have no `SceneSetup`, so they ignore it).
+
+#### deg-harness parity filters
+
+The other deg baselines (SAM3D, MaskClustering, Open3DIS, SAI3D) all finish their
+`initialize_scene` with the same three scene-level filters; `segment.py` applies
+them too (`--deg-filters`, on by default for deg datasets) so the comparison is
+fair. They live in `clutt3rseg/deg_postprocess.py`, with constants copied verbatim
+from `SegmentAnything3D`:
+
+1. **workspace crop** — keep only points inside a 0.02 m voxel grid extruded from
+   the table plane (1 m up, 0.1 m below, eroded 0.04 m in XY); drop instances with
+   <50% of their points inside. (`--workspace-voxel-size`)
+2. **min ≥ N frames** — drop instances observed in fewer than `--min-frame-count`
+   (default 3) views, counted from the leaf→instance map.
+3. **table removal** — drop the instance lying on the ground plane
+   (`--remove-table`).
+
+#### Voxel size
+
+`--voxel-size` is the point/super-voxel **resolution**, and defaults to **0.004 m**
+for deg datasets — matching the point resolution the other baselines use (SAM3D
+voxelises at 0.0035 m; MaskClustering/Open3DIS/SAI3D mesh at a 0.004 m TSDF voxel)
+— and 0.005 m for the native samples (keeps the shipped-tree reproduction exact).
 
 ### Grouping variant flag
 
@@ -243,10 +260,10 @@ same Algorithm-1 machinery (complete cross-frame leaf graph, two-stage greedy
 contraction, **average linkage**, residual substitution); they differ only in the
 spatial-similarity term and its threshold:
 
-| variant | spatial term | `tau_spat` | `tau_sem` | linkage |
-|---|---|---|---|---|
-| `paper` (default) | weighted Jaccard (∩/∪) | 0.50 | 0.65 | average |
-| `improved` | weighted overlap coeff. (∩/min) | 0.40 | 0.65 | average |
+| variant           | spatial term                    | `tau_spat` | `tau_sem` | linkage |
+| ----------------- | ------------------------------- | ---------- | --------- | ------- |
+| `paper` (default) | weighted Jaccard (∩/∪)          | 0.50       | 0.65      | average |
+| `improved`        | weighted overlap coeff. (∩/min) | 0.40       | 0.65      | average |
 
 `paper` is the literal method section and is the default. `improved` makes one principled change: the
 spatial term divides by the smaller mask's mass instead of the union (overlap
@@ -270,20 +287,20 @@ Agreement with the shipped `instance_tree.json` — Adjusted Rand Index (ARI) of
 two groupings on shared leaves, mean best-match instance IoU, instance counts
 (built/shipped), and the fraction of shipped leaf masks recovered (leaf-cov):
 
-| sequence | variant | ARI | mean IoU | inst (built/shipped) | leaf-cov |
-|---|---|---|---|---|---|
-| sample_seq1 | paper | 1.000 | 1.000 | 9/10 | 0.95 |
-| sample_seq2 | paper | 0.883 | 0.690 | 15/10 | 0.97 |
-| sample_seq3 | paper | 0.929 | 0.809 | 31/27 | 0.93 |
-| sample_seq4 | paper | 0.935 | 0.943 | 13/15 | 0.91 |
-| sample_seq5 | paper | 0.806 | 0.571 | 16/8 | 0.98 |
-| **mean** | **paper** | **0.911** | **0.803** | — | **0.95** |
-| sample_seq1 | improved | 1.000 | 1.000 | 9/10 | 0.95 |
-| sample_seq2 | improved | 0.981 | 0.950 | 10/10 | 0.97 |
-| sample_seq3 | improved | 0.941 | 0.928 | 24/27 | 0.93 |
-| sample_seq4 | improved | 0.935 | 0.943 | 13/15 | 0.91 |
-| sample_seq5 | improved | 0.973 | 0.938 | 9/8 | 0.98 |
-| **mean** | **improved** | **0.966** | **0.952** | — | **0.95** |
+| sequence    | variant      | ARI       | mean IoU  | inst (built/shipped) | leaf-cov |
+| ----------- | ------------ | --------- | --------- | -------------------- | -------- |
+| sample_seq1 | paper        | 1.000     | 1.000     | 9/10                 | 0.95     |
+| sample_seq2 | paper        | 0.883     | 0.690     | 15/10                | 0.97     |
+| sample_seq3 | paper        | 0.929     | 0.809     | 31/27                | 0.93     |
+| sample_seq4 | paper        | 0.935     | 0.943     | 13/15                | 0.91     |
+| sample_seq5 | paper        | 0.806     | 0.571     | 16/8                 | 0.98     |
+| **mean**    | **paper**    | **0.911** | **0.803** | —                    | **0.95** |
+| sample_seq1 | improved     | 1.000     | 1.000     | 9/10                 | 0.95     |
+| sample_seq2 | improved     | 0.981     | 0.950     | 10/10                | 0.97     |
+| sample_seq3 | improved     | 0.941     | 0.928     | 24/27                | 0.93     |
+| sample_seq4 | improved     | 0.935     | 0.943     | 13/15                | 0.91     |
+| sample_seq5 | improved     | 0.973     | 0.938     | 9/8                  | 0.98     |
+| **mean**    | **improved** | **0.966** | **0.952** | —                    | **0.95** |
 
 The faithful `paper` method already reproduces the released trees well (mean ARI
 ≈ 0.91; perfect on seq1). Its main residual error is mild **over-segmentation**:

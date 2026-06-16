@@ -44,10 +44,11 @@ import open3d as o3d
 import torch
 import tyro
 
-from initializerdefs import ObjectSegmentations, PointCloudObjectDef, get_observations_id_from_transforms_path
+from initializerdefs import ObjectSegmentations, PointCloudObjectDef, SceneSetup, get_observations_id_from_transforms_path
 
 from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duoduo_clip
 from clutt3rseg.deg_adapter import is_deg_dataset, materialize_workspace
+from clutt3rseg.deg_postprocess import apply_deg_filters
 from clutt3rseg.initial_segmenter import (
     initial_segmentation_consistency,
     validate_initial_dataset,
@@ -138,8 +139,15 @@ class Args:
     target_prompt: str = "object"
     """Language prompt for the upstream target export. The deg glue exports all instances regardless."""
 
-    voxel_size: float = 0.005
-    """Voxel size for superpoint downsampling."""
+    voxel_size: Optional[float] = None
+    """Point/super-voxel resolution for the spatial substrate. Defaults to 0.004 m
+    for deg datasets - matching the point resolution the other deg baselines use
+    (SAM3D's 0.0035 m voxelization, the 0.004 m TSDF voxel in MaskClustering /
+    Open3DIS / SAI3D) - and 0.005 m for the native clutt3r samples (keeps the
+    shipped-tree reproduction exact). NB this is a resolution, not SAM3D's 0.02 m
+    cross-view *matching* tolerance: clutt3r associates views by shared super-voxels
+    (no separate mutual-NN step), so coarsening to 0.02 m over-merges distinct
+    objects on clean scenes without fixing under-association on noisy ones."""
 
     depth_scale: float = 0.001
     """Multiplier converting stored depth units to metres."""
@@ -158,6 +166,21 @@ class Args:
 
     estimate_normals: bool = True
     """Estimate per-instance normals (PointCloudObjectDef requires a normals array)."""
+
+    deg_filters: bool = True
+    """Apply the deg-harness scene filters including workspace crop (table-plane voxel grid),
+    keep-if-seen-in >= N frames, and table-instance removal. Needs the deg SceneSetup
+    from scene_path; auto-skipped for the native clutt3r samples (no SceneSetup)."""
+
+    min_frame_count: int = 3
+    """Drop instances observed in fewer than this many frames (deg_filters)."""
+
+    workspace_voxel_size: float = 0.02
+    """Voxel size of the table-plane workspace grid used to crop instances (deg_filters);
+    matches the 0.02 m grid the other baselines use."""
+
+    remove_table: bool = True
+    """Within deg_filters, drop the instance lying on the table plane."""
 
     duoduo_root: Optional[Path] = None
     """External DuoduoCLIP checkout. Defaults to $DUODUOCLIP_ROOT."""
@@ -194,6 +217,21 @@ def _to_point_cloud_objects(inst2all_points: dict[int, np.ndarray], estimate_nor
     return objects
 
 
+def _load_scene(scene_path: Optional[Path], logger: logging.Logger) -> Optional[SceneSetup]:
+    """Load the deg SceneSetup pickle for the parity filters, or None if absent/unusable."""
+    if scene_path is None or not Path(scene_path).exists():
+        return None
+    try:
+        scene = SceneSetup.load(scene_path)
+    except Exception as exc:  # noqa: BLE001 - any unpickle failure means we just skip the filters
+        logger.warning("Could not load SceneSetup from %s: %s", scene_path, exc)
+        return None
+    if getattr(scene, "ground_gaussians", None) is None or getattr(scene, "ground_plane", None) is None:
+        logger.warning("SceneSetup at %s has no ground_gaussians/ground_plane; skipping parity filters.", scene_path)
+        return None
+    return scene
+
+
 def _generate_masks(experiment_data_dir: Path, args: "Args", device: str, logger: logging.Logger) -> None:
     """Generate Grounded-SAM masks into data/instance_masks/ for the frames we will use."""
     import json
@@ -228,8 +266,8 @@ def run() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(name)-18s: %(levelname)-8s %(message)s"))
     logger.addHandler(handler)
-    # Surface the tree builder's and mask backend's logs when auto-building/generating.
-    for aux in ("clutt3rseg-builder", "clutt3rseg-gsam"):
+    # Surface the tree builder's, mask backend's and deg-filter logs.
+    for aux in ("clutt3rseg-builder", "clutt3rseg-gsam", "clutt3rseg-degfilter"):
         aux_logger = logging.getLogger(aux)
         aux_logger.setLevel(logging.INFO)
         aux_logger.addHandler(handler)
@@ -246,7 +284,16 @@ def run() -> None:
         # A deg dataset (per-frame K, OpenGL poses, depth_path) is adapted into a
         # temp Clutt3R-Seg `data/` workspace; the bundled clutt3r samples are used
         # in place. See clutt3rseg.deg_adapter.
-        if is_deg_dataset(transforms_path):
+        is_deg = is_deg_dataset(transforms_path)
+
+        # deg datasets use 0.004 m to match the other baselines' point resolution
+        # (SAM3D 0.0035, mesh TSDF 0.004); native samples keep 0.005 m so the
+        # shipped-tree reproduction stays exact. See Args.voxel_size.
+        if args.voxel_size is None:
+            args.voxel_size = 0.004 if is_deg else 0.005
+            logger.info("voxel_size defaulted to %.4f m (%s).", args.voxel_size, "deg" if is_deg else "native sample")
+
+        if is_deg:
             obs_id = get_observations_id_from_transforms_path(transforms_path)
             workspace = (args.workspace_dir or Path(tempfile.gettempdir()) / "clutt3rseg_workspaces") / obs_id
             if args.refresh_workspace:
@@ -340,7 +387,26 @@ def run() -> None:
         initial_data = initial_segmentation_consistency(run_args, clip=clip, device=device)
 
         inst2all_points = initial_data["original_data"]["inst2all_points"]
+        node2inst = initial_data["node2inst"]
         logger.info("Recovered %d instances", len(inst2all_points))
+
+        # Parity filters shared by the other deg baselines (workspace crop, min-frame,
+        # table removal). They need the deg SceneSetup and only make sense for deg
+        # scenes; the native clutt3r samples have no SceneSetup, so they are skipped.
+        if args.deg_filters and is_deg:
+            scene = _load_scene(args.scene_path, logger)
+            if scene is not None:
+                inst2all_points, table_id = apply_deg_filters(
+                    inst2all_points,
+                    node2inst,
+                    scene,
+                    min_frames=args.min_frame_count,
+                    workspace_voxel_size=args.workspace_voxel_size,
+                    remove_table=args.remove_table,
+                )
+                logger.info("After deg filters: %d instances (table_id=%d)", len(inst2all_points), table_id)
+            else:
+                logger.warning("deg_filters requested but no usable SceneSetup at %s; skipping parity filters.", args.scene_path)
 
         objects = ObjectSegmentations(
             object_segmentations=_to_point_cloud_objects(inst2all_points, args.estimate_normals)
