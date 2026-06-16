@@ -31,8 +31,13 @@ logger = logging.getLogger("clutt3rseg-gsam")
 DEFAULT_DINO_ID = "IDEA-Research/grounding-dino-base"
 DEFAULT_SAM_ID = "facebook/sam-vit-huge"
 DEFAULT_PROMPT = "object"
-DEFAULT_BOX_THRESHOLD = 0.25
-DEFAULT_TEXT_THRESHOLD = 0.25
+# Calibrated to reproduce the authors' shipped sample masks: sweeping the threshold
+# and matching generated-vs-shipped masks by IoU on sample_seq2+seq4 peaks at 0.20
+# (200 vs 207 masks, recall 0.92 / precision 0.89 / F1 0.90); see
+# scripts/calibrate_mask_thresholds.py. 0.20 also keeps masks non-zero on the wider
+# deg rig views (0.25 starved them).
+DEFAULT_BOX_THRESHOLD = 0.20
+DEFAULT_TEXT_THRESHOLD = 0.20
 
 
 @dataclass

@@ -111,6 +111,20 @@ def export_prompt_pointcloud(points: np.ndarray, colors: np.ndarray, output_dir:
     return export_path
 
 
+def K_from_meta(meta: dict, frame: dict | None = None) -> np.ndarray:
+    """Camera intrinsics matrix, preferring per-frame ``K`` over a shared top-level one.
+
+    The bundled samples store one set of top-level ``fl_x/fl_y/cx/cy`` shared by all
+    frames; deg datasets (and any multi-camera rig) instead carry a per-frame 3x3
+    ``K``. Supporting both lets the same pipeline run on either.
+    """
+    if frame is not None and "K" in frame:
+        return np.asarray(frame["K"], np.float32).reshape(3, 3)
+    if "fl_x" in meta:
+        return np.array([[meta["fl_x"], 0, meta["cx"]], [0, meta["fl_y"], meta["cy"]], [0, 0, 1]], np.float32)
+    raise KeyError("transforms.json has neither a per-frame 'K' nor top-level 'fl_x' intrinsics.")
+
+
 def backproject(depth, K, max_depth):
     h, w = depth.shape
     ys, xs = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
@@ -253,8 +267,11 @@ def mask_filter_dense_instances(
                     m = cv2.erode(m, kernel, iterations=1)
                 masks[lid] = m
 
+        fmeta = frames_meta[fidx]
+        K_f = np.asarray(fmeta["K"], np.float32).reshape(3, 3) if "K" in fmeta else K
         frame_cache[fidx] = {
-            'w2c': np.linalg.inv(np.array(frames_meta[fidx]['transform_matrix'])),
+            'w2c': np.linalg.inv(np.array(fmeta['transform_matrix'])),
+            'K': K_f,
             'masks': masks,
             'size': masks[list(masks.keys())[0]].shape if masks else (0,0)
         }
@@ -280,7 +297,7 @@ def mask_filter_dense_instances(
             if not cache or not cache['masks']: continue
 
             w2c, H, W = cache['w2c'], cache['size'][0], cache['size'][1]
-            u, v, z, is_visible = _project_points(xyz, K, w2c, H, W)
+            u, v, z, is_visible = _project_points(xyz, cache['K'], w2c, H, W)
 
             visible_counts += is_visible.astype(np.int32)
 

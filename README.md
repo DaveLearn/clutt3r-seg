@@ -193,6 +193,49 @@ baseline runs on the same measured/sensor depth as the other baselines:
 back-projection keeps only valid pixels, holes are mapped to -1 and filtered with
 a consistent global offset (matching how e.g. MaskClustering handles holes).
 
+### Calibrating the mask threshold
+
+The Grounded-SAM threshold was **calibrated to reproduce the shipped sample
+masks** rather than guessed. `scripts/calibrate_mask_thresholds.py` sweeps the
+GroundingDINO threshold and matches generated vs shipped masks by IoU on
+`sample_seq2`+`sample_seq4`:
+
+```bash
+pixi run --frozen python scripts/calibrate_mask_thresholds.py
+```
+
+F1 (recall of shipped masks × precision) peaks at **0.20** (200 generated vs 207
+shipped masks; recall 0.92, precision 0.89), which is the default
+`--mask-box-threshold` / `--mask-text-threshold`.
+
+### Running on deg datasets (eg / deg-ds / graspnet)
+
+`segment.py` accepts a deg `transforms.json` directly: when the input is a deg
+dataset (per-frame `K`, OpenGL poses, `depth_path`) rather than the clutt3r sample
+layout, `clutt3rseg/deg_adapter.py` materialises a temp `data/` workspace from the
+deg observations, handling the two real differences:
+
+* **Convention** — deg poses are OpenGL/NeRF; each is converted to OpenCV
+  cam-to-world (`T_cv = X_WV @ diag(1,-1,-1,1)`, verified against
+  `psdframe.Frame.X_VW_opencv`).
+* **Per-frame intrinsics** — deg datasets are often multi-camera rigs with a
+  different `K` per frame; intrinsics are now resolved per frame everywhere
+  (`utils.K_from_meta`), not assumed shared.
+
+```bash
+# masks → tree → objects, all auto; workspace cached under $TMPDIR/clutt3rseg_workspaces/<id>
+pixi run --frozen segment_external datasets/graspnet-mvseg/scene_0124/transforms.json scene.pkl
+```
+
+Quality depends on depth registration. On **graspnet** (clean, depth-color-aligned,
+~5% holes) cross-view spatial grouping works well (e.g. scene_0124: 66 leaves →
+18 instances with 23 spatial merges → 11 after filtering). On **deg-ds** (real
+multi-cam, 12–23% holes, cm-level registration error) the same-object points from
+different views fall into different 5 mm super-voxels, so spatial overlap collapses
+(`spatial=0`) and the scene over-segments — clutt3r-seg relies on the dense,
+consistent depth the paper assumes. For such data raise `--voxel-size` (≈0.02–0.03
+restores cross-view Jaccard) and/or use `--variant improved`.
+
 ### Grouping variant flag
 
 `build_tree.py` and `segment.py` take `--variant {paper,improved}`. Both use the

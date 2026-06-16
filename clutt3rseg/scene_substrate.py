@@ -39,7 +39,7 @@ import open3d as o3d
 import pandas as pd
 from PIL import Image
 
-from .utils import _bbox, _letterbox, backproject, load_depth, refine_masks_by_depth
+from .utils import _bbox, _letterbox, K_from_meta, backproject, load_depth, refine_masks_by_depth
 
 logger = logging.getLogger("clutt3rseg-builder")
 
@@ -77,13 +77,6 @@ class SceneSubstrate:
 
     meta: dict = field(default_factory=dict)
     """transforms.json contents (intrinsics + frames), for downstream reuse."""
-
-
-def _intrinsics(meta: dict) -> np.ndarray:
-    return np.array(
-        [[meta["fl_x"], 0, meta["cx"]], [0, meta["fl_y"], meta["cy"]], [0, 0, 1]],
-        np.float32,
-    )
 
 
 def _supervoxel_labels(xyz: np.ndarray, normals: np.ndarray, gc_lambda: float) -> np.ndarray:
@@ -154,8 +147,7 @@ def build_scene_substrate(
     data_dir = Path(experiment_data_dir) / "data"
     meta = json.load(open(data_dir / "transforms.json"))
     frames_meta = meta["frames"]
-    K = _intrinsics(meta)
-    instance_mask_path = data_dir / "instance_masks"
+    instance_mask_path = data_dir / "instance_masks"  # per-frame K resolved in the loop
 
     frame_masks: dict[int, dict[int, np.ndarray]] = {}
     crops: dict[Leaf, np.ndarray] = {}
@@ -179,7 +171,7 @@ def build_scene_substrate(
         raw_image = Image.open(rgb_path).convert("RGB")
         H, W = rgb.shape[:2]
         depth = load_depth(depth_path, depth_scale)
-        pts_cam, uvs = backproject(depth, K, max_depth)
+        pts_cam, uvs = backproject(depth, K_from_meta(meta, fr), max_depth)
         T = np.asarray(fr["transform_matrix"], np.float32)
         pts_wld = (T[:3, :3] @ pts_cam.T + T[:3, 3:4]).T
 

@@ -32,7 +32,9 @@ import contextlib
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from typing import Literal, Optional
@@ -42,9 +44,10 @@ import open3d as o3d
 import torch
 import tyro
 
-from initializerdefs import ObjectSegmentations, PointCloudObjectDef
+from initializerdefs import ObjectSegmentations, PointCloudObjectDef, get_observations_id_from_transforms_path
 
 from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duoduo_clip
+from clutt3rseg.deg_adapter import is_deg_dataset, materialize_workspace
 from clutt3rseg.initial_segmenter import (
     initial_segmentation_consistency,
     validate_initial_dataset,
@@ -94,6 +97,15 @@ class Args:
     scene_path: tyro.conf.Positional[Path]
     """Path to the pickled deg SceneSetup (accepted for contract compatibility; unused)."""
 
+    workspace_dir: Optional[Path] = None
+    """For deg datasets: where to materialize the Clutt3R-Seg workspace (images/depth/masks/
+    tree). Defaults to a stable per-dataset dir under the system temp, so masks/tree cache
+    across runs. Ignored for the native clutt3r sample layout."""
+
+    refresh_workspace: bool = False
+    """For deg datasets: rebuild the workspace from scratch (re-export RGB/depth, drop cached
+    masks and tree) instead of reusing it."""
+
     initial_idx: Optional[str] = None
     """Comma/space separated initial frame indices. Defaults to instance_tree.json's initial_idx.
     Required when no instance_tree.json exists and it has to be built."""
@@ -117,10 +129,10 @@ class Args:
     mask_prompt: str = "object"
     """Grounded-SAM text prompt for mask generation (the paper uses the single token 'object')."""
 
-    mask_box_threshold: float = 0.25
-    """GroundingDINO box confidence threshold for mask generation."""
+    mask_box_threshold: float = 0.20
+    """GroundingDINO box confidence threshold (0.20 calibrated to reproduce the sample masks)."""
 
-    mask_text_threshold: float = 0.25
+    mask_text_threshold: float = 0.20
     """GroundingDINO text confidence threshold for mask generation."""
 
     target_prompt: str = "object"
@@ -225,18 +237,32 @@ def run() -> None:
     args = tyro.cli(Args)
 
     transforms_path = args.transforms_path.resolve()
-    experiment_data_dir = _experiment_dir_from_transforms(transforms_path)
-
-    output_dir = experiment_data_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    tree_path = experiment_data_dir / "data" / ARTIFACT_NAME
 
     # All upstream chatter goes to stderr; only the final objects_path line is on stdout.
     with contextlib.redirect_stdout(sys.stderr):
         logger.info("Starting Clutt3R-Seg initialization")
         logger.info("transforms_path=%s", transforms_path)
+
+        # A deg dataset (per-frame K, OpenGL poses, depth_path) is adapted into a
+        # temp Clutt3R-Seg `data/` workspace; the bundled clutt3r samples are used
+        # in place. See clutt3rseg.deg_adapter.
+        if is_deg_dataset(transforms_path):
+            obs_id = get_observations_id_from_transforms_path(transforms_path)
+            workspace = (args.workspace_dir or Path(tempfile.gettempdir()) / "clutt3rseg_workspaces") / obs_id
+            if args.refresh_workspace:
+                shutil.rmtree(workspace, ignore_errors=True)
+            logger.info("deg dataset detected; materializing workspace at %s ...", workspace)
+            n_frames = materialize_workspace(transforms_path, workspace, overwrite_images=args.refresh_workspace)
+            experiment_data_dir = workspace
+            if args.initial_idx is None:
+                args.initial_idx = ",".join(str(i) for i in range(n_frames))
+                logger.info("No --initial-idx given; using all %d frames.", n_frames)
+        else:
+            experiment_data_dir = _experiment_dir_from_transforms(transforms_path)
+
         logger.info("experiment_data_dir=%s", experiment_data_dir)
+        (experiment_data_dir / "output").mkdir(parents=True, exist_ok=True)
+        tree_path = experiment_data_dir / "data" / ARTIFACT_NAME
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 

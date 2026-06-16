@@ -3,7 +3,7 @@
 
 from .utils import (
     load_depth, _bbox, backproject, refine_masks_by_depth, _letterbox,
-    distinct_palette,
+    distinct_palette, K_from_meta,
     mask_filter_dense_instances, filter_invalid_instances_by_superpoint_stats, reconstruct_instances_from_superpoints,
     export_prompt_pointcloud,
 )
@@ -71,7 +71,9 @@ def validate_initial_dataset(args) -> None:
         if not depth_path.exists():
             missing.append(f"missing depth image: {depth_path}")
         if instance_mask_path.exists() and not mask_files:
-            missing.append(f"missing instance masks for frame {fidx}: {instance_mask_path}/mask_{fidx:06d}_*.png")
+            # A frame where the detector found no objects is tolerated (it simply
+            # contributes no leaves), rather than failing the whole sequence.
+            print(f"[warn] Frame {fidx}: no instance masks; it will not contribute leaves.", flush=True)
 
     if missing:
         details = "\n  - ".join(missing)
@@ -88,9 +90,10 @@ def initial_segmentation_consistency(args, clip, device = "cuda"):
     initial_scene_root = Path(args.experiment_data_dir) / "data"
     meta = json.load(open(initial_scene_root / "transforms.json"))
     frames_meta = meta["frames"]
-    K = np.array([[meta["fl_x"], 0, meta["cx"]],
-                  [0, meta["fl_y"], meta["cy"]],
-                  [0, 0, 1]], np.float32)
+    # Intrinsics are resolved per frame (K_from_meta prefers a per-frame "K" and
+    # falls back to shared top-level fl_x), so multi-camera rigs with different K
+    # per view work, not just the single-intrinsics samples.
+    K = K_from_meta(meta, frames_meta[0])  # default/fallback for the mask filter
 
     initial_frames_meta = [frames_meta[i] for i in args.initial_idx]
 
@@ -118,7 +121,7 @@ def initial_segmentation_consistency(args, clip, device = "cuda"):
         raw_images[f_idx_global] = Image.open(rgb_path).convert("RGB")
         H_assert, W_assert = rgb.shape[:2]
         depth = load_depth(depth_path, args.depth_scale)
-        pts_cam, uvs = backproject(depth, K, args.max_depth)
+        pts_cam, uvs = backproject(depth, K_from_meta(meta, fr), args.max_depth)
         T = np.asarray(fr["transform_matrix"], np.float32)
         pts_wld = (T[:3,:3] @ pts_cam.T + T[:3,3:4]).T
 
@@ -543,24 +546,26 @@ def initial_segmentation_consistency(args, clip, device = "cuda"):
 
     target_prompt_emb = clip.encode_text(args.target_prompt)
     target_prompt_emb = target_prompt_emb.squeeze(0).cpu().numpy()
+    # Only consider instances that survived the point-cloud filters, so the best
+    # prompt match is always exportable. The prompt target is a convenience for the
+    # single-object use case; the deg glue exports all instances regardless, so a
+    # missing match is non-fatal.
     inst2target_sim = {
         inst_id: float(np.dot(emb, target_prompt_emb))
         for inst_id, emb in instance_embeddings.items()
+        if inst_id in export_inst2all_points
     }
-    if not inst2target_sim:
-        raise RuntimeError("No instance embeddings were computed for prompt-target export.")
-
-    target_id = max(inst2target_sim, key=inst2target_sim.get)
-    if target_id not in export_inst2all_points:
-        raise KeyError(f"Target instance {target_id} is missing from point-cloud export data.")
-
-    target_points = export_inst2all_points[target_id]
-    export_prompt_pointcloud(
-        target_points[:, :3],
-        target_points[:, 3:6],
-        output_dir,
-        args.target_prompt,
-    )
+    if inst2target_sim:
+        target_id = max(inst2target_sim, key=inst2target_sim.get)
+        target_points = export_inst2all_points[target_id]
+        export_prompt_pointcloud(
+            target_points[:, :3],
+            target_points[:, 3:6],
+            output_dir,
+            args.target_prompt,
+        )
+    else:
+        print("[warn] No surviving instance matched the target prompt; skipping prompt-target export.", flush=True)
 
     original_data = {
         "inst2all_points": export_inst2all_points,
