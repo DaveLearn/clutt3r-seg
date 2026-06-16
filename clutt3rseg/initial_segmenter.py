@@ -162,10 +162,17 @@ def initial_segmentation_consistency(args, clip, device = "cuda"):
         mid_full.append(label_img[uvs[:,1], uvs[:,0]])
         offset += len(pts_wld)
         if len(pts_wld) != H_assert * W_assert:
+            # Measured/sensor depth has holes (invalid pixels), unlike the dense
+            # MVSAnywhere depth the paper assumes. This is tolerated: backprojection
+            # already keeps only valid pixels, idx_img maps the rest to -1, and the
+            # per-mask code below filters those out (valid = idx_pts != -1) with a
+            # consistent global offset. So we only warn instead of failing, to stay
+            # comparable to the other baselines which run on measured depth.
             invalid = H_assert * W_assert - len(pts_wld)
-            raise ValueError(
-                f"Frame {f_idx_global} has {invalid} missing points after backprojection. "
-                "Use dense depth maps without invalid pixels."
+            print(
+                f"[warn] Frame {f_idx_global}: {invalid} invalid/holed depth pixels "
+                f"({100.0 * invalid / (H_assert * W_assert):.1f}%); proceeding on valid pixels only.",
+                flush=True,
             )
 
     xyz_full = np.concatenate(xyz_full, 0)

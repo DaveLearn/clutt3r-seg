@@ -49,6 +49,7 @@ from clutt3rseg.initial_segmenter import (
     initial_segmentation_consistency,
     validate_initial_dataset,
 )
+from clutt3rseg.mask_backends.grounded_sam import generate_masks_for_frames, load_grounded_sam
 from clutt3rseg.tree_artifacts import ARTIFACT_NAME, load_instance_tree_artifact
 from clutt3rseg.tree_builder import build_instance_tree_artifact, resolve_variant, write_instance_tree_artifact
 
@@ -109,6 +110,19 @@ class Args:
     update_idx: Optional[str] = None
     """When building the tree, also emit containment trees for these update frames."""
 
+    generate_masks_if_missing: bool = True
+    """If data/instance_masks/ is absent, generate them with Grounded-SAM (GroundingDINO +
+    SAM, prompt below) instead of failing. The release ships no detector."""
+
+    mask_prompt: str = "object"
+    """Grounded-SAM text prompt for mask generation (the paper uses the single token 'object')."""
+
+    mask_box_threshold: float = 0.25
+    """GroundingDINO box confidence threshold for mask generation."""
+
+    mask_text_threshold: float = 0.25
+    """GroundingDINO text confidence threshold for mask generation."""
+
     target_prompt: str = "object"
     """Language prompt for the upstream target export. The deg glue exports all instances regardless."""
 
@@ -168,16 +182,45 @@ def _to_point_cloud_objects(inst2all_points: dict[int, np.ndarray], estimate_nor
     return objects
 
 
+def _generate_masks(experiment_data_dir: Path, args: "Args", device: str, logger: logging.Logger) -> None:
+    """Generate Grounded-SAM masks into data/instance_masks/ for the frames we will use."""
+    import json
+
+    data_dir = experiment_data_dir / "data"
+    frames_meta = json.loads((data_dir / "transforms.json").read_text())["frames"]
+    if args.initial_idx is not None:
+        idx = set(_parse_initial_idx(args.initial_idx))
+        if args.update_idx:
+            idx |= set(_parse_initial_idx(args.update_idx))
+        idx = sorted(idx)
+    else:
+        idx = list(range(len(frames_meta)))
+    image_paths = {i: data_dir / Path(frames_meta[i]["file_path"]).with_suffix(".png") for i in idx}
+
+    logger.info("No instance_masks/ found; generating Grounded-SAM masks (prompt=%r) for %d frames ...", args.mask_prompt, len(idx))
+    gsam = load_grounded_sam(device=device)
+    counts = generate_masks_for_frames(
+        gsam,
+        image_paths,
+        data_dir / "instance_masks",
+        prompt=args.mask_prompt,
+        box_threshold=args.mask_box_threshold,
+        text_threshold=args.mask_text_threshold,
+    )
+    logger.info("Generated %d masks over %d frames", sum(counts.values()), len(counts))
+
+
 def run() -> None:
     logger = logging.getLogger("clutt3rseg-segmenter")
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(name)-18s: %(levelname)-8s %(message)s"))
     logger.addHandler(handler)
-    # Surface the tree builder's substrate/grouping stats when auto-building.
-    builder_logger = logging.getLogger("clutt3rseg-builder")
-    builder_logger.setLevel(logging.INFO)
-    builder_logger.addHandler(handler)
+    # Surface the tree builder's and mask backend's logs when auto-building/generating.
+    for aux in ("clutt3rseg-builder", "clutt3rseg-gsam"):
+        aux_logger = logging.getLogger(aux)
+        aux_logger.setLevel(logging.INFO)
+        aux_logger.addHandler(handler)
 
     args = tyro.cli(Args)
 
@@ -196,6 +239,14 @@ def run() -> None:
         logger.info("experiment_data_dir=%s", experiment_data_dir)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # The public release ships no Grounded-SAM detector; generate the per-frame
+        # instance masks faithfully (GroundingDINO + SAM, prompt "object") when they
+        # are absent, so the pipeline can run on sequences that ship only RGB-D.
+        mask_dir = experiment_data_dir / "data" / "instance_masks"
+        if args.generate_masks_if_missing and not (mask_dir.exists() and any(mask_dir.glob("mask_*.png"))):
+            _generate_masks(experiment_data_dir, args, device, logger)
+
         logger.info("Loading DuoduoCLIP (device=%s) ...", device)
         clip = load_duoduo_clip(
             checkpoint=args.clip_checkpoint,

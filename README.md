@@ -164,9 +164,34 @@ constituent pairs) in two stages — first by super-voxel spatial similarity
 pixi run build_tree samples/sample_seq2 --initial-idx 0,1,2,3,4,5,6,7 --update-idx 8,9
 ```
 
-`segment.py` also auto-builds the tree when it is missing
-(`--build-tree-if-missing`, on by default), so new sequences no longer require a
-precomputed artifact — only the Grounded-SAM `instance_masks/` and dense depth.
+`segment.py` auto-builds the tree when it is missing (`--build-tree-if-missing`,
+on by default), so a sequence with RGB-D + poses no longer needs a precomputed
+artifact.
+
+### Mask generation (Grounded-SAM)
+
+The release expects `data/instance_masks/` to already exist but ships no detector.
+We reconstruct the paper's front-end — **Grounded-SAM** (GroundingDINO + SAM,
+prompt `object`) via HuggingFace `transformers` — in
+`clutt3rseg/mask_backends/grounded_sam.py`:
+
+```bash
+# writes <seq>/data/instance_masks/mask_<frame>_<inst>.png (downloads checkpoints first run)
+pixi run generate_masks samples/sample_seq2 --frames 0,1,2,3,4,5,6,7
+```
+
+`segment.py` also auto-generates masks when `data/instance_masks/` is absent
+(`--generate-masks-if-missing`, on by default). With this, the full pipeline runs
+from RGB + depth + poses alone: missing masks → Grounded-SAM, missing tree →
+builder, then the segmenter.
+
+### Measured (non-dense) depth
+
+The paper uses dense MVSAnywhere depth; the consumer originally *required* it
+(it raised on any invalid pixel). That check is **loosened** to a warning so the
+baseline runs on the same measured/sensor depth as the other baselines:
+back-projection keeps only valid pixels, holes are mapped to -1 and filtered with
+a consistent global offset (matching how e.g. MaskClustering handles holes).
 
 ### Grouping variant flag
 

@@ -17,9 +17,11 @@ same kind of super-voxel substrate the consumer later votes on. The downstream
 consumer is left untouched; it re-derives its own substrate from the masks and
 the ``leaf2inst`` mapping this builder writes.
 
-The builder is intentionally more lenient than the consumer about depth holes
-(it warns rather than raising) so it can still emit a tree for sequences whose
-depth is not perfectly dense; the consumer keeps its own strict check.
+Both this builder and the consumer (``initial_segmenter``) tolerate depth holes:
+back-projection keeps only valid pixels and the per-mask code maps the rest to
+-1 and filters them with a consistent global offset, so measured/sensor depth
+(with invalid pixels) works without the dense MVSAnywhere depth the paper assumes
+-- keeping the baseline comparable to the others, which use measured depth.
 """
 
 from __future__ import annotations
@@ -207,10 +209,10 @@ def build_scene_substrate(
         rgb_full_parts.append(rgb[uvs[:, 1], uvs[:, 0]])
         offset += len(pts_wld)
         if len(pts_wld) != H * W:
+            invalid = H * W - len(pts_wld)
             logger.warning(
-                "Frame %d has %d invalid/holed depth pixels; the consumer requires dense depth and will reject this sequence.",
-                f_idx,
-                H * W - len(pts_wld),
+                "Frame %d: %d invalid/holed depth pixels (%.1f%%); proceeding on valid pixels only (measured depth).",
+                f_idx, invalid, 100.0 * invalid / (H * W),
             )
 
     if not xyz_full_parts:

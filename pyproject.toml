@@ -70,6 +70,8 @@ tyro = ">=0.8"
 # Extra DuoduoCLIP requirements not already in [project.dependencies].
 h5py = ">=3.0"
 wandb = ">=0.16"
+# Grounded-SAM (GroundingDINO + SAM) mask front-end, run via HuggingFace transformers.
+transformers = ">=4.44"
 
 [tool.pixi.dependencies]
 python = "3.11.*"
@@ -90,6 +92,8 @@ setup_duoduo_clip = "bash scripts/setup_duoduo_clip.sh external/DuoduoCLIP"
 segment_external = "python segment.py"
 # Reconstruct data/instance_tree.json from the paper (the release omits the builder).
 build_tree = "python build_tree.py"
+# Generate Grounded-SAM instance masks (the release omits the detector too).
+generate_masks = "python generate_masks.py"
 # Native upstream entry points (useful for sample-sequence validation).
 run_initial = "bash scripts/run_initial.sh"
 run_update = "bash scripts/run_update.sh"
