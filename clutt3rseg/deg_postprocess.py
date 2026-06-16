@@ -29,7 +29,9 @@ from __future__ import annotations
 from collections import defaultdict
 import logging
 import math
+from pathlib import Path
 
+import cv2
 import numpy as np
 import open3d as o3d
 
@@ -153,6 +155,56 @@ def determine_table_instance(inst2pts: dict, ground_plane, dist_thresh: float = 
         if n_near / len(arr) > frac_thresh and n_near > best_count:
             best_count, best_id = n_near, int(inst_id)
     return best_id
+
+
+def build_instance_masks_from_leaves(
+    node2inst: dict,
+    kept_inst_ids,
+    mask_dir,
+    frame_specs,
+) -> tuple[list[int], list[np.ndarray]]:
+    """Per-frame instance-id masks (the form the deg harness requires), built by
+    painting each surviving instance's Grounded-SAM leaf masks.
+
+    This is clutt3r-seg's canonical 2D labeling: ``node2inst`` assigns every leaf
+    mask to exactly one instance, so painting a leaf with its instance id is exact
+    (it mirrors MaskClustering's ``_build_instance_groups_from_clustered_masks``,
+    which paints per-frame source masks by object). Object ids are 1-indexed,
+    0 = background; only ``kept_inst_ids`` (post-filter survivors) are painted.
+
+    ``frame_specs`` is ``[(workspace_frame_idx, deg_frame_id, h, w), ...]`` for
+    *all* deg frames, so the harness finds a mask for every ``frame.id``; frames
+    that contributed no surviving leaf get an all-zero mask. Returns
+    ``(frame_ids, pixel_object_ids)``.
+    """
+    inst2out = {int(inst_id): k + 1 for k, inst_id in enumerate(sorted(kept_inst_ids))}
+    frame_leaves: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for (fidx, lid), inst_id in node2inst.items():
+        out_id = inst2out.get(int(inst_id))
+        if out_id is not None:
+            frame_leaves[int(fidx)].append((int(lid), out_id))
+
+    frame_ids: list[int] = []
+    pixel_object_ids: list[np.ndarray] = []
+    for fidx, deg_id, h, w in frame_specs:
+        canvas = np.zeros((h, w), np.int32)
+        painted: list[tuple[int, np.ndarray, int]] = []
+        for lid, out_id in frame_leaves.get(fidx, []):
+            mpath = Path(mask_dir) / f"mask_{fidx:06d}_{lid:02d}.png"
+            if not mpath.exists():
+                continue
+            m = cv2.imread(str(mpath), cv2.IMREAD_GRAYSCALE)
+            if m is None:
+                continue
+            if m.shape != (h, w):
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+            painted.append((int((m > 0).sum()), m > 0, out_id))
+        # Paint larger leaves first so a smaller, more specific mask wins on overlap.
+        for _, m, out_id in sorted(painted, key=lambda t: -t[0]):
+            canvas[m] = out_id
+        frame_ids.append(int(deg_id))
+        pixel_object_ids.append(canvas)
+    return frame_ids, pixel_object_ids
 
 
 def apply_deg_filters(

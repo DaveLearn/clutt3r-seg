@@ -18,10 +18,14 @@ sequence layout::
 
 It runs the upstream initial-segmentation pipeline and exports *all* recovered
 instances (not just the prompt-matched target) as a class-agnostic
-``ObjectSegmentations``, so the result is comparable to the other baselines.
+``ObjectSegmentations``, so the result is comparable to the other baselines. For
+deg datasets it emits per-frame ``InstanceMaskObjectsDef`` (the form the deg
+harness requires, matching SAM3D / MaskClustering / Open3DIS / SAI3D); for the
+native clutt3r samples it emits the point-cloud instances.
 
-The ``scene_path`` positional is accepted for contract compatibility but unused:
-Clutt3R-Seg does not consume the deg ``SceneSetup``.
+The ``scene_path`` positional is the deg ``SceneSetup`` pickle, consumed by the
+parity filters (workspace crop / min-frame / table removal) on deg datasets; the
+native clutt3r samples have no ``SceneSetup`` and ignore it.
 
 Outputs ``objects_path: <path>`` on stdout for the parent process to read.
 """
@@ -44,11 +48,17 @@ import open3d as o3d
 import torch
 import tyro
 
-from initializerdefs import ObjectSegmentations, PointCloudObjectDef, SceneSetup, get_observations_id_from_transforms_path
+from initializerdefs import (
+    InstanceMaskObjectsDef,
+    ObjectSegmentations,
+    PointCloudObjectDef,
+    SceneSetup,
+    get_observations_id_from_transforms_path,
+)
 
 from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duoduo_clip
 from clutt3rseg.deg_adapter import is_deg_dataset, materialize_workspace
-from clutt3rseg.deg_postprocess import apply_deg_filters
+from clutt3rseg.deg_postprocess import apply_deg_filters, build_instance_masks_from_leaves
 from clutt3rseg.initial_segmenter import (
     initial_segmentation_consistency,
     validate_initial_dataset,
@@ -408,16 +418,39 @@ def run() -> None:
             else:
                 logger.warning("deg_filters requested but no usable SceneSetup at %s; skipping parity filters.", args.scene_path)
 
-        objects = ObjectSegmentations(
-            object_segmentations=_to_point_cloud_objects(inst2all_points, args.estimate_normals)
-        )
+        n_objects = len(inst2all_points)
+        if is_deg:
+            # The deg harness (run_modelling) requires per-frame InstanceMaskObjectsDef,
+            # as every other deg baseline returns. Build it from the surviving instances'
+            # leaf masks (clutt3r's canonical 2D labeling); the ScanNet 3D eval reprojects
+            # these onto the mesh when mesh_vertex_instance_ids is absent (as for
+            # SAM3D / MaskClustering).
+            import json
+
+            ws_frames = json.loads((experiment_data_dir / "data" / "transforms.json").read_text())["frames"]
+            orig_frames = json.loads(transforms_path.read_text()).get("frames", [])
+            frame_specs = [
+                (
+                    i,
+                    int(orig_frames[i]["id"]) if i < len(orig_frames) and "id" in orig_frames[i] else i,
+                    int(fm["h"]),
+                    int(fm["w"]),
+                )
+                for i, fm in enumerate(ws_frames)
+            ]
+            frame_ids, pixel_object_ids = build_instance_masks_from_leaves(node2inst, set(inst2all_points.keys()), mask_dir, frame_specs)
+            objects = ObjectSegmentations(
+                object_segmentations=InstanceMaskObjectsDef(frame_ids=frame_ids, pixel_object_ids=pixel_object_ids)
+            )
+        else:
+            objects = ObjectSegmentations(object_segmentations=_to_point_cloud_objects(inst2all_points, args.estimate_normals))
 
         out_root = Path(__file__).parent / "outputs"
         out_dir = out_root / f"{time.strftime('%Y%m%d-%H%M%S')}_{experiment_data_dir.name}"
         out_dir.mkdir(parents=True, exist_ok=True)
         objects_path = out_dir / "objectsdef.pkl"
         objects.save(objects_path)
-        logger.info("Saved %d objects to %s", len(objects.object_segmentations), objects_path)
+        logger.info("Saved %d objects (%s) to %s", n_objects, "instance masks" if is_deg else "point clouds", objects_path)
 
     print(f"objects_path: {objects_path}")
 
