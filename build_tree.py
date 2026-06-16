@@ -16,18 +16,17 @@ Writes ``<experiment_data_dir>/data/instance_tree.json``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import tyro
 
 from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duoduo_clip
 from clutt3rseg.tree_builder import (
-    TAU_SEMANTIC,
-    TAU_SPATIAL,
     build_instance_tree_artifact,
+    resolve_variant,
     write_instance_tree_artifact,
 )
 
@@ -40,6 +39,12 @@ def _parse_idx(value: str) -> list[int]:
 class Args:
     experiment_data_dir: tyro.conf.Positional[Path]
     """Sequence directory containing data/transforms.json, images, depth, instance_masks."""
+
+    variant: Literal["paper", "improved"] = "paper"
+    """Grouping variant. 'paper' (default) = faithful method section: weighted-Jaccard
+    spatial (tau_spat=0.5), semantic tau_sem=0.65, average linkage. 'improved' = overlap
+    coefficient at tau_spat=0.4 (higher recall on partial cross-view masks). Override
+    individual knobs below."""
 
     initial_idx: str = "0,1,2,3,4,5,6,7"
     """Comma/space separated initial frame indices to associate across views."""
@@ -55,8 +60,13 @@ class Args:
     max_depth: float = 5.0
     gc_lambda: float = 0.010
     min_points: int = 3
-    tau_spat: float = TAU_SPATIAL
-    tau_sem: float = TAU_SEMANTIC
+
+    # Per-knob overrides (default None -> take the value from --variant).
+    spatial_metric: Optional[Literal["overlap", "jaccard"]] = None
+    tau_spat: Optional[float] = None
+    tau_sem: Optional[float] = None
+    linkage: Optional[Literal["average", "max"]] = None
+    containment_thresh: Optional[float] = None
 
     duoduo_root: Optional[Path] = None
     """External DuoduoCLIP checkout. Defaults to $DUODUOCLIP_ROOT."""
@@ -67,6 +77,19 @@ class Args:
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(name)-18s: %(levelname)-8s %(message)s")
     args = tyro.cli(Args)
+
+    overrides = {
+        k: v
+        for k, v in {
+            "spatial_metric": args.spatial_metric,
+            "tau_spat": args.tau_spat,
+            "tau_sem": args.tau_sem,
+            "linkage": args.linkage,
+            "containment_thresh": args.containment_thresh,
+        }.items()
+        if v is not None
+    }
+    config = replace(resolve_variant(args.variant), **overrides)
 
     clip = None
     if not args.no_clip:
@@ -80,13 +103,12 @@ def run() -> None:
         _parse_idx(args.initial_idx),
         clip=clip,
         update_idx=_parse_idx(args.update_idx) if args.update_idx else None,
+        config=config,
         voxel_size=args.voxel_size,
         depth_scale=args.depth_scale,
         max_depth=args.max_depth,
         gc_lambda=args.gc_lambda,
         min_points=args.min_points,
-        tau_spat=args.tau_spat,
-        tau_sem=args.tau_sem,
     )
     out_path = write_instance_tree_artifact(args.experiment_data_dir, artifact)
     n_leaves = len(artifact["initial"]["leaf2inst"])

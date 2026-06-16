@@ -47,17 +47,57 @@ from .tree_artifacts import ARTIFACT_NAME, leaf_id
 
 logger = logging.getLogger("clutt3rseg-builder")
 
-# Grouping thresholds. The paper lists tau_spat=0.5 (weighted Jaccard) and
-# tau_sem=0.65. We keep the semantic threshold but use a weighted *overlap
-# coefficient* for the spatial term with a 0.4 acceptance (see _spatial_score for
-# why), which reproduces the shipped sample artifacts (ARI 0.98, exact instance
-# count) where a strict Jaccard at 0.5 under-segments cross-view partial masks.
-TAU_SPATIAL = 0.4
+# Grouping thresholds.
 TAU_SEMANTIC = 0.65
 # A mask whose pixels are >= this fraction inside another mask is that mask's child.
 CONTAINMENT_THRESH = 0.85
 # A leaf dominated this much by the ground super-voxel is dropped before grouping.
 GROUND_FRACTION = 0.5
+
+
+@dataclass(frozen=True)
+class GroupingConfig:
+    """Knobs for the two-stage cross-view grouping (paper Algorithm 1).
+
+    The faithful algorithm is agglomerative average-linkage clustering on a
+    complete graph of per-frame-tree leaf nodes, with edges only between leaves of
+    *different* frames (``phi(u) != phi(v)``): stage 1 greedily contracts the
+    max-spatial edge while ``S_spatial >= tau_spat``, then stage 2 contracts the
+    max-semantic edge while ``S_semantic >= tau_sem``; on each merge the new node's
+    edge to a neighbour is the mean similarity over all constituent pairs
+    (GroupAndRewire, lines 32-35).
+
+    Two presets are provided (see :data:`PAPER` and :data:`IMPROVED`):
+
+    * ``paper`` (default) -- the literal method section: spatial term is the
+      super-voxel **weighted Jaccard** (intersection-over-union), ``tau_spat=0.5``,
+      ``tau_sem=0.65``, average linkage.
+    * ``improved`` -- identical except the spatial term is the weighted **overlap
+      coefficient** (intersection-over-min) with ``tau_spat=0.4``, which improves
+      recall on partial cross-view masks (see :func:`_pair_spatial`).
+
+    The bare ``GroupingConfig()`` defaults are the ``paper`` values.
+    """
+
+    spatial_metric: str = "jaccard"  # "jaccard" (paper) | "overlap" (improved)
+    tau_spat: float = 0.5
+    tau_sem: float = TAU_SEMANTIC
+    linkage: str = "average"  # "average" (paper, mean over constituent pairs) | "max"
+    containment_thresh: float = CONTAINMENT_THRESH
+
+
+PAPER = GroupingConfig()
+IMPROVED = GroupingConfig(spatial_metric="overlap", tau_spat=0.4)
+
+# Backwards-compatible module-level default (the paper spatial acceptance).
+TAU_SPATIAL = PAPER.tau_spat
+
+
+def resolve_variant(name: str) -> GroupingConfig:
+    presets = {"paper": PAPER, "improved": IMPROVED}
+    if name not in presets:
+        raise ValueError(f"Unknown grouping variant '{name}'. Choose one of {sorted(presets)}.")
+    return presets[name]
 
 
 # --------------------------------------------------------------------------- #
@@ -109,168 +149,199 @@ def build_containment_forest(
 
 
 # --------------------------------------------------------------------------- #
-# Grouping
+# Grouping (paper Algorithm 1: agglomerative average-linkage on a cross-frame
+# leaf graph, spatial stage then semantic stage)
 # --------------------------------------------------------------------------- #
-@dataclass
-class _Group:
-    members: list[Leaf]
-    occ: dict[int, float]  # super-voxel id -> summed covered down-voxel count
-    emb_sum: np.ndarray | None  # sum of member (unit) embeddings, or None
+def _pair_spatial(occ_a: dict[int, float], occ_b: dict[int, float], counts_per_sp: np.ndarray, metric: str) -> float:
+    """Weighted super-voxel spatial similarity between two leaf masks, occupancy capped at 1.
 
-    @property
-    def emb(self) -> np.ndarray | None:
-        if self.emb_sum is None:
-            return None
-        n = np.linalg.norm(self.emb_sum)
-        return self.emb_sum / n if n > 0 else None
+    ``metric="jaccard"`` is the paper's term, intersection-over-**union**.
+    ``metric="overlap"`` is the overlap coefficient, intersection-over-**min**.
 
-    @property
-    def n_down(self) -> float:
-        return float(sum(self.occ.values()))
-
-
-def _spatial_score(a: _Group, b: _Group, counts_per_sp: np.ndarray) -> float:
-    """Weighted super-voxel overlap coefficient (intersection-over-minimum), occupancy capped at 1.
-
-    The paper defines the spatial term as a super-voxel weighted Jaccard
-    (intersection-over-union). A strict Jaccard, however, penalises partial
-    cross-view observations: each view of an object covers only the super-voxels
-    it can see, so two single-view masks of the same object overlap ~0.5 at best
-    and never reach tau_spat=0.5, leaving objects under-segmented. Distinct
-    objects, in contrast, share essentially no fine 5 mm super-voxels (measured
-    inter-instance overlap p90 < 0.01 on the GraspClutter6D samples). Using the
-    overlap coefficient (divide by the smaller group's mass instead of the union)
-    preserves that precision while letting a partial view that is contained in the
-    accumulated group score ~1, which is exactly what greedy cross-view grouping
-    needs. On the bundled samples this recovers the shipped grouping (ARI ~0.98).
+    Under a strict Jaccard each view of an object covers only the super-voxels it
+    can see, so two single-view masks of the same object overlap ~0.5 at best;
+    distinct objects share ~0 fine 5 mm super-voxels (measured inter-instance
+    overlap p90 < 0.01). Dividing by the smaller mask's mass (overlap coefficient)
+    instead of the union improves recall on partial cross-view masks while keeping
+    that precision.
     """
-    inter = mass_a = mass_b = 0.0
-    for k in set(a.occ) | set(b.occ):
+    inter = mass_a = mass_b = union = 0.0
+    for k in set(occ_a) | set(occ_b):
         cap = counts_per_sp[k]
-        oa = min(1.0, a.occ.get(k, 0.0) / cap)
-        ob = min(1.0, b.occ.get(k, 0.0) / cap)
+        oa = min(1.0, occ_a.get(k, 0.0) / cap)
+        ob = min(1.0, occ_b.get(k, 0.0) / cap)
         inter += cap * min(oa, ob)
         mass_a += cap * oa
         mass_b += cap * ob
-    denom = min(mass_a, mass_b)
+        union += cap * max(oa, ob)
+    denom = union if metric == "jaccard" else min(mass_a, mass_b)
     return inter / (denom + 1e-8) if denom > 0 else 0.0
 
 
-def _semantic_score(a: _Group, b: _Group) -> float:
-    ea, eb = a.emb, b.emb
-    if ea is None or eb is None:
-        return -1.0
-    return float(np.dot(ea, eb))
+def _agglomerate(
+    leaves: list[Leaf],
+    spat: dict[tuple[int, int], float],
+    sem: dict[tuple[int, int], float],
+    tau_spat: float,
+    tau_sem: float,
+    linkage: str,
+) -> tuple[list[list[int]], dict[str, int]]:
+    """Paper Algorithm 1: greedy edge-contraction on a complete cross-frame leaf graph.
 
-
-def _merge_into(groups: dict[int, _Group], dst: int, src: int) -> None:
-    g, s = groups[dst], groups[src]
-    g.members.extend(s.members)
-    for k, v in s.occ.items():
-        g.occ[k] = g.occ.get(k, 0.0) + v
-    if s.emb_sum is not None:
-        g.emb_sum = s.emb_sum if g.emb_sum is None else g.emb_sum + s.emb_sum
-    del groups[src]
-
-
-def _greedy_merge(groups: dict[int, _Group], score_fn, threshold: float, *, require_singleton: bool = False) -> int:
-    """Repeatedly merge the highest-scoring pair >= threshold. Returns #merges.
-
-    With ``require_singleton`` a pair is only eligible if at least one side is a
-    single leaf. This implements the paper's "remaining nodes are grouped by
-    semantic similarity": the semantic stage may attach leftover residual leaves
-    but must not collapse two already-formed spatial clusters into one blob.
+    ``spat``/``sem`` hold the per-edge similarities for cross-frame leaf-index
+    pairs ``(i, j)`` with ``i < j`` (same-frame pairs are simply absent, enforcing
+    ``phi(u) != phi(v)``). Stage 1 contracts the max-spatial edge while it is
+    ``>= tau_spat``; stage 2 then the max-semantic edge while ``>= tau_sem``. On
+    each contraction the merged node's similarity to every neighbour is the mean
+    over all constituent leaf pairs (``linkage="average"``, GroupAndRewire), which
+    equals the Lance-Williams average update. A merge is forbidden when the two
+    clusters already share a frame (a single object appears once per frame).
     """
-    merges = 0
-    while len(groups) > 1:
-        best_score, best_pair = threshold, None
-        ids = list(groups)
-        for ia in range(len(ids)):
-            for ib in range(ia + 1, len(ids)):
-                ga, gb = groups[ids[ia]], groups[ids[ib]]
-                if require_singleton and len(ga.members) > 1 and len(gb.members) > 1:
-                    continue
-                s = score_fn(ga, gb)
-                if s >= best_score:
-                    best_score, best_pair = s, (ids[ia], ids[ib])
-        if best_pair is None:
-            break
-        _merge_into(groups, best_pair[0], best_pair[1])
-        merges += 1
-    return merges
+    members: dict[int, list[int]] = {i: [i] for i in range(len(leaves))}
+    frames: dict[int, set[int]] = {i: {leaves[i][0]} for i in range(len(leaves))}
+    size: dict[int, int] = {i: 1 for i in range(len(leaves))}
+    active = set(range(len(leaves)))
+    spat = dict(spat)
+    sem = dict(sem)
+    next_id = len(leaves)
 
+    def okey(a: int, b: int) -> tuple[int, int]:
+        return (a, b) if a < b else (b, a)
 
-def _apply_residual_substitution(groups: dict[int, _Group], forests: dict[int, tuple]) -> int:
-    """Fold over-segmented residual leaves into one group per parent.
+    def best(simdict: dict[tuple[int, int], float], tau: float) -> tuple[int, int] | None:
+        chosen, chosen_s = None, tau
+        for (a, b), s in simdict.items():
+            if s >= chosen_s and a in active and b in active:
+                chosen, chosen_s = (a, b), s
+        return chosen
 
-    A leaf is *residual* if its group is still a singleton after grouping. When
-    every descendant leaf of an internal node is residual, those fragments are a
-    single over-segmented object, so we union them into one group.
-    """
-    folds = 0
-    leaf2gid = {leaf: gid for gid, g in groups.items() for leaf in g.members}
-    singletons = {leaf for gid, g in groups.items() if len(g.members) == 1 for leaf in g.members}
-
-    for frame, (_parent_of, _children, _leaves, descendant_leaves) in forests.items():
-        for dleaves in descendant_leaves.values():
-            present = [(frame, m) for m in dleaves if (frame, m) in leaf2gid]
-            if len(present) < 2 or not all(x in singletons for x in present):
+    def contract(a: int, b: int) -> None:
+        nonlocal next_id
+        w = next_id
+        next_id += 1
+        members[w] = members[a] + members[b]
+        frames[w] = frames[a] | frames[b]
+        size[w] = size[a] + size[b]
+        active.discard(a)
+        active.discard(b)
+        for c in list(active):
+            if frames[w] & frames[c]:  # would put two leaves of one frame together
                 continue
-            target = leaf2gid[present[0]]
+            for sd in (spat, sem):
+                sa = sd.get(okey(a, c))
+                sb = sd.get(okey(b, c))
+                sa = 0.0 if sa is None else sa
+                sb = 0.0 if sb is None else sb
+                if linkage == "max":
+                    sd[okey(w, c)] = max(sa, sb)
+                else:  # average linkage (Lance-Williams over constituent leaves)
+                    sd[okey(w, c)] = (size[a] * sa + size[b] * sb) / (size[a] + size[b])
+        active.add(w)
+
+    counts = {"spatial": 0, "semantic": 0}
+    while True:
+        pair = best(spat, tau_spat)
+        if pair is None:
+            break
+        contract(*pair)
+        counts["spatial"] += 1
+    while True:
+        pair = best(sem, tau_sem)
+        if pair is None:
+            break
+        contract(*pair)
+        counts["semantic"] += 1
+
+    return [members[c] for c in active], counts
+
+
+def _apply_residual_substitution(leaf2cluster: dict[Leaf, int], forests: dict[int, tuple]) -> int:
+    """Fold over-segmented residual leaves into one cluster per parent (in place).
+
+    A leaf is *residual* if it is still alone in its cluster after grouping. When
+    every descendant leaf of an internal containment node is residual, those
+    fragments are one over-segmented object, so we union them into one cluster.
+    """
+    sizes: dict[int, int] = {}
+    for cid in leaf2cluster.values():
+        sizes[cid] = sizes.get(cid, 0) + 1
+    folds = 0
+    for frame, (_po, _ch, _lv, descendant_leaves) in forests.items():
+        for dleaves in descendant_leaves.values():
+            present = [(frame, m) for m in dleaves if (frame, m) in leaf2cluster]
+            if len(present) < 2 or not all(sizes[leaf2cluster[x]] == 1 for x in present):
+                continue
+            target = leaf2cluster[present[0]]
             for x in present[1:]:
-                gid = leaf2gid[x]
-                if gid != target and gid in groups:
-                    _merge_into(groups, target, gid)
-                    for leaf in groups[target].members:
-                        leaf2gid[leaf] = target
-                    folds += 1
+                leaf2cluster[x] = target
+                folds += 1
     return folds
 
 
 def build_initial_leaf2inst(
     substrate: SceneSubstrate,
     embeddings: dict[Leaf, np.ndarray],
-    *,
-    tau_spat: float = TAU_SPATIAL,
-    tau_sem: float = TAU_SEMANTIC,
+    config: GroupingConfig | None = None,
 ) -> tuple[dict[Leaf, int], dict[int, tuple], set[Leaf]]:
+    config = config or PAPER
     counts_per_sp = substrate.counts_per_sp.astype(np.float64)
     ground = substrate.ground_sp_id
 
-    forests = {f: build_containment_forest(masks) for f, masks in substrate.frame_masks.items()}
+    forests = {
+        f: build_containment_forest(masks, config.containment_thresh)
+        for f, masks in substrate.frame_masks.items()
+    }
 
-    groups: dict[int, _Group] = {}
+    # Vertices of the leaf graph: per-frame-tree leaves, minus ground/empty masks.
+    leaves: list[Leaf] = []
+    occ_of: dict[Leaf, dict[int, float]] = {}
     ground_leaves: set[Leaf] = set()
-    gid = 0
-    for frame, (_po, _ch, leaves, _dl) in forests.items():
-        for m in leaves:
+    for frame, (_po, _ch, frame_leaves, _dl) in forests.items():
+        for m in frame_leaves:
             leaf = (frame, m)
             counts = substrate.mask2sp_counts.get(leaf, {})
             total = sum(counts.values())
             gfrac = counts.get(ground, 0) / total if total else 0.0
             occ = {sp: float(c) for sp, c in counts.items() if sp != ground}
-            emb = embeddings.get(leaf)
             if total and gfrac > GROUND_FRACTION:
                 ground_leaves.add(leaf)
                 continue
-            if not occ and emb is None:
+            if not occ and leaf not in embeddings:
                 continue
-            groups[gid] = _Group([leaf], occ, None if emb is None else emb.copy())
-            gid += 1
+            leaves.append(leaf)
+            occ_of[leaf] = occ
 
-    n_leaves = len(groups)
-    n_spat = _greedy_merge(groups, lambda a, b: _spatial_score(a, b, counts_per_sp), tau_spat)
-    n_sem = _greedy_merge(groups, _semantic_score, tau_sem, require_singleton=True)
-    n_fold = _apply_residual_substitution(groups, forests)
-    n_spat2 = _greedy_merge(groups, lambda a, b: _spatial_score(a, b, counts_per_sp), tau_spat)
-    logger.info(
-        "Grouping: %d leaves -> %d instances (spatial=%d, semantic=%d, residual-fold=%d, final-spatial=%d)",
-        n_leaves, len(groups), n_spat, n_sem, n_fold, n_spat2,
+    # Complete graph over cross-frame leaf pairs (phi(u) != phi(v)); each edge
+    # stores spatial and semantic similarity.
+    spat_edges: dict[tuple[int, int], float] = {}
+    sem_edges: dict[tuple[int, int], float] = {}
+    for i in range(len(leaves)):
+        for j in range(i + 1, len(leaves)):
+            if leaves[i][0] == leaves[j][0]:
+                continue  # same frame -> no edge
+            spat_edges[(i, j)] = _pair_spatial(occ_of[leaves[i]], occ_of[leaves[j]], counts_per_sp, config.spatial_metric)
+            ei, ej = embeddings.get(leaves[i]), embeddings.get(leaves[j])
+            sem_edges[(i, j)] = float(np.dot(ei, ej)) if ei is not None and ej is not None else -1.0
+
+    clusters, counts = _agglomerate(
+        leaves, spat_edges, sem_edges, config.tau_spat, config.tau_sem, config.linkage
     )
 
-    # Largest instances first, purely for stable, readable ids.
-    ordered = sorted(groups.values(), key=lambda g: g.n_down, reverse=True)
-    leaf2inst = {leaf: inst_id for inst_id, g in enumerate(ordered) for leaf in g.members}
+    leaf2cluster = {leaves[idx]: cid for cid, idxs in enumerate(clusters) for idx in idxs}
+    n_fold = _apply_residual_substitution(leaf2cluster, forests)
+
+    # Re-number instances largest-first (by leaf count) for stable, readable ids.
+    cluster_sizes: dict[int, int] = {}
+    for cid in leaf2cluster.values():
+        cluster_sizes[cid] = cluster_sizes.get(cid, 0) + 1
+    order = {cid: rank for rank, cid in enumerate(sorted(cluster_sizes, key=lambda c: -cluster_sizes[c]))}
+    leaf2inst = {leaf: order[cid] for leaf, cid in leaf2cluster.items()}
+
+    logger.info(
+        "Grouping[%s/%s]: %d leaves -> %d instances (spatial=%d, semantic=%d, residual-fold=%d)",
+        config.spatial_metric, config.linkage, len(leaves), len(set(leaf2inst.values())),
+        counts["spatial"], counts["semantic"], n_fold,
+    )
     return leaf2inst, forests, ground_leaves
 
 
@@ -335,14 +406,14 @@ def build_instance_tree_artifact(
     clip=None,
     *,
     update_idx: list[int] | None = None,
+    config: GroupingConfig | None = None,
     voxel_size: float = 0.005,
     depth_scale: float = 0.001,
     max_depth: float = 5.0,
     gc_lambda: float = 0.010,
     min_points: int = 3,
-    tau_spat: float = TAU_SPATIAL,
-    tau_sem: float = TAU_SEMANTIC,
 ) -> dict:
+    config = config or PAPER
     experiment_data_dir = Path(experiment_data_dir)
     substrate = build_scene_substrate(
         experiment_data_dir,
@@ -361,9 +432,7 @@ def build_instance_tree_artifact(
         logger.warning("No DuoduoCLIP model provided; skipping the semantic grouping stage.")
         embeddings = {}
 
-    leaf2inst, _forests, ground_leaves = build_initial_leaf2inst(
-        substrate, embeddings, tau_spat=tau_spat, tau_sem=tau_sem
-    )
+    leaf2inst, _forests, ground_leaves = build_initial_leaf2inst(substrate, embeddings, config)
 
     initial = {
         "initial_idx": [int(i) for i in initial_idx],
@@ -381,12 +450,16 @@ def build_instance_tree_artifact(
         if not masks:
             logger.warning("Update frame %d has no instance masks; skipping.", uf)
             continue
-        parent_of, _children, leaves, descendant_leaves = build_containment_forest(masks)
+        parent_of, _children, leaves, descendant_leaves = build_containment_forest(masks, config.containment_thresh)
         updates[str(int(uf))] = _serialize_update_tree(uf, parent_of, leaves, descendant_leaves)
 
     return {
         "schema_version": 1,
-        "source": "Instance-tree artifact reconstructed by clutt3rseg.tree_builder (paper arXiv:2602.11660).",
+        "source": (
+            "Instance-tree artifact reconstructed by clutt3rseg.tree_builder "
+            f"(paper arXiv:2602.11660), grouping: spatial={config.spatial_metric} "
+            f"tau_spat={config.tau_spat} tau_sem={config.tau_sem} linkage={config.linkage}."
+        ),
         "initial": initial,
         "updates": updates,
     }

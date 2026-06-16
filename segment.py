@@ -35,7 +35,7 @@ from pathlib import Path
 import sys
 import time
 from types import SimpleNamespace
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import open3d as o3d
@@ -50,7 +50,7 @@ from clutt3rseg.initial_segmenter import (
     validate_initial_dataset,
 )
 from clutt3rseg.tree_artifacts import ARTIFACT_NAME, load_instance_tree_artifact
-from clutt3rseg.tree_builder import build_instance_tree_artifact, write_instance_tree_artifact
+from clutt3rseg.tree_builder import build_instance_tree_artifact, resolve_variant, write_instance_tree_artifact
 
 
 def _patch_open3d_pathlike() -> None:
@@ -100,6 +100,11 @@ class Args:
     build_tree_if_missing: bool = True
     """If data/instance_tree.json is absent, reconstruct it with the paper's tree builder
     (clutt3rseg.tree_builder) instead of failing. Requires --initial-idx."""
+
+    tree_variant: Literal["paper", "improved"] = "paper"
+    """Grouping variant used when auto-building the tree: 'paper' (default, faithful method
+    section: weighted-Jaccard spatial, average linkage) or 'improved' (overlap coefficient,
+    higher recall on partial cross-view masks)."""
 
     update_idx: Optional[str] = None
     """When building the tree, also emit containment trees for these update frames."""
@@ -169,6 +174,10 @@ def run() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(name)-18s: %(levelname)-8s %(message)s"))
     logger.addHandler(handler)
+    # Surface the tree builder's substrate/grouping stats when auto-building.
+    builder_logger = logging.getLogger("clutt3rseg-builder")
+    builder_logger.setLevel(logging.INFO)
+    builder_logger.addHandler(handler)
 
     args = tyro.cli(Args)
 
@@ -205,12 +214,16 @@ def run() -> None:
                 )
             build_idx = _parse_initial_idx(args.initial_idx)
             update_idx = _parse_initial_idx(args.update_idx) if args.update_idx else None
-            logger.info("No instance_tree.json found; building it for initial_idx=%s ...", build_idx)
+            logger.info(
+                "No instance_tree.json found; building it (variant=%s) for initial_idx=%s ...",
+                args.tree_variant, build_idx,
+            )
             artifact = build_instance_tree_artifact(
                 experiment_data_dir,
                 build_idx,
                 clip=clip,
                 update_idx=update_idx,
+                config=resolve_variant(args.tree_variant),
                 voxel_size=args.voxel_size,
                 depth_scale=args.depth_scale,
                 max_depth=args.max_depth,
