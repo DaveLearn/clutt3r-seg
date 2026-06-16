@@ -37,3 +37,57 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["clutt3rseg*"]
+
+# ---------------------------------------------------------------------------
+# pixi environment.
+#
+# Mirrors the upstream Docker base (pytorch/pytorch:2.4.1-cuda12.1) without
+# Docker so the segmenter can run under `pixi run` like the other baselines.
+# DuoduoCLIP is fetched separately by the `setup_duoduo_clip` task (it is not
+# redistributed here) and discovered through DUODUOCLIP_ROOT set below.
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-options.dependency-overrides]
+numpy = "<2.0"
+
+[tool.pixi.pypi-dependencies]
+# Pin torch/torchvision to the cu121 wheels matching the upstream Docker base.
+torch = { version = "==2.4.1", index = "https://download.pytorch.org/whl/cu121" }
+torchvision = { version = "==0.19.1", index = "https://download.pytorch.org/whl/cu121" }
+# The clutt3r-seg package itself (exposes the `clutt3rseg` import package and
+# pulls in its declared runtime dependencies: open3d, opencv-python, lightning,
+# hydra-core, timm, ...).
+clutt3r-seg = { path = ".", editable = true }
+# Shared deg interchange types used by the segment.py glue.
+psdframe = { path = "../../packages/psdframe", editable = true }
+initializerdefs = { path = "../../packages/initializerdefs", editable = true }
+psdstaticdataset = { path = "../../packages/psdstaticdataset", editable = true }
+# CLI parsing for segment.py (matches the other baselines' segmenter entry points).
+tyro = ">=0.8"
+# Extra DuoduoCLIP requirements not already in [project.dependencies].
+h5py = ">=3.0"
+wandb = ">=0.16"
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+pip = ">=24"
+setuptools = ">=68"
+wheel = "*"
+git = ">=2.40"
+
+[tool.pixi.activation]
+# DuoduoCLIP is cloned here by `pixi run setup_duoduo_clip`; the clip backend
+# discovers it via DUODUOCLIP_ROOT (see clutt3rseg/clip_backends/duoduo.py).
+env = { DUODUOCLIP_ROOT = "$PIXI_PROJECT_ROOT/external/DuoduoCLIP" }
+
+[tool.pixi.tasks]
+# One-time bootstrap: clone DuoduoCLIP + install its open_clip_mod into the env.
+setup_duoduo_clip = "bash scripts/setup_duoduo_clip.sh external/DuoduoCLIP"
+# deg external-segmenter entry point (transforms.json + scene.pkl -> objects).
+segment_external = "python segment.py"
+# Native upstream entry points (useful for sample-sequence validation).
+run_initial = "bash scripts/run_initial.sh"
+run_update = "bash scripts/run_update.sh"
