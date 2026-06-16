@@ -49,7 +49,8 @@ from clutt3rseg.initial_segmenter import (
     initial_segmentation_consistency,
     validate_initial_dataset,
 )
-from clutt3rseg.tree_artifacts import load_instance_tree_artifact
+from clutt3rseg.tree_artifacts import ARTIFACT_NAME, load_instance_tree_artifact
+from clutt3rseg.tree_builder import build_instance_tree_artifact, write_instance_tree_artifact
 
 
 def _patch_open3d_pathlike() -> None:
@@ -93,7 +94,15 @@ class Args:
     """Path to the pickled deg SceneSetup (accepted for contract compatibility; unused)."""
 
     initial_idx: Optional[str] = None
-    """Comma/space separated initial frame indices. Defaults to instance_tree.json's initial_idx."""
+    """Comma/space separated initial frame indices. Defaults to instance_tree.json's initial_idx.
+    Required when no instance_tree.json exists and it has to be built."""
+
+    build_tree_if_missing: bool = True
+    """If data/instance_tree.json is absent, reconstruct it with the paper's tree builder
+    (clutt3rseg.tree_builder) instead of failing. Requires --initial-idx."""
+
+    update_idx: Optional[str] = None
+    """When building the tree, also emit containment trees for these update frames."""
 
     target_prompt: str = "object"
     """Language prompt for the upstream target export. The deg glue exports all instances regardless."""
@@ -169,11 +178,47 @@ def run() -> None:
     output_dir = experiment_data_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    tree_path = experiment_data_dir / "data" / ARTIFACT_NAME
+
     # All upstream chatter goes to stderr; only the final objects_path line is on stdout.
     with contextlib.redirect_stdout(sys.stderr):
         logger.info("Starting Clutt3R-Seg initialization")
         logger.info("transforms_path=%s", transforms_path)
         logger.info("experiment_data_dir=%s", experiment_data_dir)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("Loading DuoduoCLIP (device=%s) ...", device)
+        clip = load_duoduo_clip(
+            checkpoint=args.clip_checkpoint,
+            device=device,
+            duoduo_root=args.duoduo_root,
+        )
+
+        # The public release ships no instance-tree builder; reconstruct it from the
+        # paper (clutt3rseg.tree_builder) when the artifact is missing so the pipeline
+        # can run on new sequences, not just the bundled samples.
+        if not tree_path.exists() and args.build_tree_if_missing:
+            if args.initial_idx is None:
+                raise ValueError(
+                    f"{tree_path} is missing and must be built, but no --initial-idx was given. "
+                    "Pass e.g. --initial-idx '0,1,2,3,4,5,6,7'."
+                )
+            build_idx = _parse_initial_idx(args.initial_idx)
+            update_idx = _parse_initial_idx(args.update_idx) if args.update_idx else None
+            logger.info("No instance_tree.json found; building it for initial_idx=%s ...", build_idx)
+            artifact = build_instance_tree_artifact(
+                experiment_data_dir,
+                build_idx,
+                clip=clip,
+                update_idx=update_idx,
+                voxel_size=args.voxel_size,
+                depth_scale=args.depth_scale,
+                max_depth=args.max_depth,
+                gc_lambda=args.gc_lambda,
+                min_points=args.min_points,
+            )
+            write_instance_tree_artifact(experiment_data_dir, artifact)
+            logger.info("Wrote %s", tree_path)
 
         if args.initial_idx is not None:
             initial_idx = _parse_initial_idx(args.initial_idx)
@@ -200,14 +245,6 @@ def run() -> None:
         )
 
         validate_initial_dataset(run_args)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info("Loading DuoduoCLIP (device=%s) ...", device)
-        clip = load_duoduo_clip(
-            checkpoint=args.clip_checkpoint,
-            device=device,
-            duoduo_root=args.duoduo_root,
-        )
 
         logger.info("Running initial segmentation ...")
         initial_data = initial_segmentation_consistency(run_args, clip=clip, device=device)
