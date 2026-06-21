@@ -54,6 +54,10 @@ from initializerdefs import (
     PointCloudObjectDef,
     SceneSetup,
     get_observations_id_from_transforms_path,
+    runtime_start,
+    runtime_stop,
+    runtime_pause,
+    runtime_resume,
 )
 
 from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duoduo_clip
@@ -242,7 +246,7 @@ def _load_scene(scene_path: Optional[Path], logger: logging.Logger) -> Optional[
     return scene
 
 
-def _generate_masks(experiment_data_dir: Path, args: "Args", device: str, logger: logging.Logger) -> None:
+def _generate_masks(experiment_data_dir: Path, args: "Args", device: str, logger: logging.Logger, rt: "dict | None" = None) -> None:
     """Generate Grounded-SAM masks into data/instance_masks/ for the frames we will use."""
     import json
 
@@ -258,7 +262,11 @@ def _generate_masks(experiment_data_dir: Path, args: "Args", device: str, logger
     image_paths = {i: data_dir / Path(frames_meta[i]["file_path"]).with_suffix(".png") for i in idx}
 
     logger.info("No instance_masks/ found; generating Grounded-SAM masks (prompt=%r) for %d frames ...", args.mask_prompt, len(idx))
+    if rt is not None:
+        runtime_pause(rt)  # exclude Grounded-SAM checkpoint load from the timed compute
     gsam = load_grounded_sam(device=device)
+    if rt is not None:
+        runtime_resume(rt)
     counts = generate_masks_for_frames(
         gsam,
         image_paths,
@@ -321,6 +329,8 @@ def run() -> None:
         (experiment_data_dir / "output").mkdir(parents=True, exist_ok=True)
         tree_path = experiment_data_dir / "data" / ARTIFACT_NAME
 
+        _rt = runtime_start("clutt3r-seg", scene=experiment_data_dir.name)
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # The public release ships no Grounded-SAM detector; generate the per-frame
@@ -328,14 +338,16 @@ def run() -> None:
         # are absent, so the pipeline can run on sequences that ship only RGB-D.
         mask_dir = experiment_data_dir / "data" / "instance_masks"
         if args.generate_masks_if_missing and not (mask_dir.exists() and any(mask_dir.glob("mask_*.png"))):
-            _generate_masks(experiment_data_dir, args, device, logger)
+            _generate_masks(experiment_data_dir, args, device, logger, rt=_rt)
 
         logger.info("Loading DuoduoCLIP (device=%s) ...", device)
+        runtime_pause(_rt)  # exclude DuoduoCLIP checkpoint load from the timed compute
         clip = load_duoduo_clip(
             checkpoint=args.clip_checkpoint,
             device=device,
             duoduo_root=args.duoduo_root,
         )
+        runtime_resume(_rt)
 
         # The public release ships no instance-tree builder; reconstruct it from the
         # paper (clutt3rseg.tree_builder) when the artifact is missing so the pipeline
@@ -406,11 +418,15 @@ def run() -> None:
         if args.deg_filters and is_deg:
             scene = _load_scene(args.scene_path, logger)
             if scene is not None:
+                # Match the other baselines: the usual >=3 min-frame rule demands the
+                # object appear in *every* frame when there are only 3 views, which is
+                # too strict, so relax to >=2 when there are <=3 views.
+                min_frames = 2 if len(initial_idx) <= 3 else args.min_frame_count
                 inst2all_points, table_id = apply_deg_filters(
                     inst2all_points,
                     node2inst,
                     scene,
-                    min_frames=args.min_frame_count,
+                    min_frames=min_frames,
                     workspace_voxel_size=args.workspace_voxel_size,
                     remove_table=args.remove_table,
                 )
@@ -444,6 +460,8 @@ def run() -> None:
             )
         else:
             objects = ObjectSegmentations(object_segmentations=_to_point_cloud_objects(inst2all_points, args.estimate_normals))
+
+        runtime_stop(_rt)
 
         out_root = Path(__file__).parent / "outputs"
         out_dir = out_root / f"{time.strftime('%Y%m%d-%H%M%S')}_{experiment_data_dir.name}"

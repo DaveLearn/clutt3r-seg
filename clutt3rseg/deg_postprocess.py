@@ -7,7 +7,8 @@ The deg-adapted baselines (SAM3D, MaskClustering, Open3DIS, SAI3D) all finish
 1. **workspace crop** - keep only points inside a voxel grid extruded from the
    table plane (1 m up, 0.1 m below, eroded inwards in XY); drop instances that
    are mostly outside it.
-2. **min-frame >= 3** - drop instances observed in fewer than 3 views.
+2. **min-frame >= 3** - drop instances observed in fewer than 3 views (the
+   caller relaxes this to >=2 for <=3-view setups, matching the other baselines).
 3. **table removal** - drop the single instance lying on the table plane.
 
 Clutt3R-Seg natively does none of these - it exports every recovered instance -
