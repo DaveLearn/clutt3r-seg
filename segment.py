@@ -418,10 +418,8 @@ def run() -> None:
         if args.deg_filters and is_deg:
             scene = _load_scene(args.scene_path, logger)
             if scene is not None:
-                # Match the other baselines: the usual >=3 min-frame rule demands the
-                # object appear in *every* frame when there are only 3 views, which is
-                # too strict, so relax to >=2 when there are <=3 views.
-                min_frames = 2 if len(initial_idx) <= 3 else args.min_frame_count
+                # Match the other baselines: min 3 frames
+                min_frames = 3
                 inst2all_points, table_id = apply_deg_filters(
                     inst2all_points,
                     node2inst,
