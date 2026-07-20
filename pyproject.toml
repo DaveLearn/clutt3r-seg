@@ -71,7 +71,12 @@ tyro = ">=0.8"
 h5py = ">=3.0"
 wandb = ">=0.16"
 # Grounded-SAM (GroundingDINO + SAM) mask front-end, run via HuggingFace transformers.
-transformers = ">=4.44"
+# <5: the Grounded-SAM front end is written against the transformers 4.x API.
+transformers = ">=4.44,<5"
+# DuoduoCLIP's modified open_clip (installs as open_clip_torch). The rest of
+# DuoduoCLIP is a source tree, not a package, so scripts/setup_duoduo_clip.sh
+# clones it -- keep that script's DUODUOCLIP_REV equal to the rev below.
+open_clip_torch = { git = "https://github.com/3dlg-hcvc/DuoduoCLIP.git", subdirectory = "open_clip_mod", rev = "3111a77041fc82e656fe589bd7737b41ea34c10d" }
 
 [tool.pixi.dependencies]
 python = "3.11.*"
@@ -79,17 +84,30 @@ pip = ">=24"
 setuptools = ">=68"
 wheel = "*"
 git = ">=2.40"
+# System libraries the pypi wheels dlopen but do not bundle: libglib/libgthread
+# and libGL for opencv-python, libgomp for open3d. Without them the imports fail
+# at runtime even though `pixi install` succeeds.
+libglib = ">=2.80"
+libgl = "*"
+libgomp = "*"
 
 [tool.pixi.activation]
 # DuoduoCLIP is cloned here by `pixi run setup_duoduo_clip`; the clip backend
 # discovers it via DUODUOCLIP_ROOT (see clutt3rseg/clip_backends/duoduo.py).
-env = { DUODUOCLIP_ROOT = "$PIXI_PROJECT_ROOT/external/DuoduoCLIP" }
+# LD_LIBRARY_PATH: the pypi open3d/opencv wheels carry no RPATH into the conda
+# env, so they cannot find libgomp/libglib there without this.
+env = { DUODUOCLIP_ROOT = "$PIXI_PROJECT_ROOT/external/DuoduoCLIP", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
 
 [tool.pixi.tasks]
-# One-time bootstrap: clone DuoduoCLIP + install its open_clip_mod into the env.
-setup_duoduo_clip = "bash scripts/setup_duoduo_clip.sh external/DuoduoCLIP"
+# Clones the DuoduoCLIP source tree DUODUOCLIP_ROOT points at. `outputs` makes
+# this a cache hit once cloned, so it is safe to hang off segment_external.
+setup_duoduo_clip = { cmd = "bash scripts/setup_duoduo_clip.sh external/DuoduoCLIP", inputs = [
+    "scripts/setup_duoduo_clip.sh",
+], outputs = [
+    "external/DuoduoCLIP/src/model/wrapper.py",
+] }
 # deg external-segmenter entry point (transforms.json + scene.pkl -> objects).
-segment_external = "python segment.py"
+segment_external = { cmd = "python segment.py", depends-on = ["setup_duoduo_clip"] }
 # Native upstream entry points (useful for sample-sequence validation).
 run_initial = "bash scripts/run_initial.sh"
 run_update = "bash scripts/run_update.sh"
