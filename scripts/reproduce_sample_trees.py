@@ -4,7 +4,7 @@ The public release ships ``data/instance_tree.json`` for each sample but not the
 builder that produced it. This script rebuilds each sample's tree from its
 ``transforms.json`` + ``depth`` + ``instance_masks`` using
 :mod:`clutt3rseg.tree_builder` and reports how closely the reconstruction matches
-the shipped artifact, for one or more grouping variants.
+the shipped artifact.
 
 It is the confirmation that the reimplemented builder is correct: a high
 agreement with the shipped trees means the reconstruction recovers the same
@@ -22,7 +22,7 @@ leaf and edge counts), which depend only on the 2D containment routine.
 Usage::
 
     pixi run --frozen python scripts/reproduce_sample_trees.py
-    pixi run --frozen python scripts/reproduce_sample_trees.py --variants improved,paper --csv-out /tmp/repro.csv
+    pixi run --frozen python scripts/reproduce_sample_trees.py --csv-out /tmp/repro.csv
 """
 
 from __future__ import annotations
@@ -41,11 +41,11 @@ from clutt3rseg.clip_backends.duoduo import DEFAULT_DUODUO_CHECKPOINT, load_duod
 from clutt3rseg.scene_substrate import build_scene_substrate
 from clutt3rseg.tree_artifacts import ARTIFACT_NAME, leaf_id
 from clutt3rseg.tree_builder import (
+    PAPER,
     _load_frame_masks,
     build_containment_forest,
     build_initial_leaf2inst,
     compute_leaf_embeddings,
-    resolve_variant,
 )
 
 
@@ -57,11 +57,8 @@ class Args:
     sequences: Optional[str] = None
     """Comma separated sequence names. Default: every sub-dir with data/instance_tree.json."""
 
-    variants: str = "improved,paper"
-    """Comma separated grouping variants to evaluate."""
-
     csv_out: Optional[Path] = None
-    """Optional path to write the per-(sequence, variant) metrics as CSV."""
+    """Optional path to write the per-sequence metrics as CSV."""
 
     no_clip: bool = False
     """Skip DuoduoCLIP (spatial-only grouping; semantic stage disabled)."""
@@ -155,9 +152,6 @@ def run() -> None:
     else:
         seqs = sorted(p for p in args.samples_root.iterdir() if (p / "data" / ARTIFACT_NAME).exists())
 
-    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    configs = {v: resolve_variant(v) for v in variants}
-
     clip = None
     if not args.no_clip:
         import torch
@@ -165,7 +159,7 @@ def run() -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         clip = load_duoduo_clip(checkpoint=args.clip_checkpoint, device=device, duoduo_root=args.duoduo_root)
 
-    header = f"{'sequence':16s} {'variant':9s} {'leaves(b/s)':12s} {'inst(b/s)':10s} {'ARI':>6s} {'IoU':>6s} {'perfect':>8s} {'leaf-cov':>8s}"
+    header = f"{'sequence':16s} {'leaves(b/s)':12s} {'inst(b/s)':10s} {'ARI':>6s} {'IoU':>6s} {'perfect':>8s} {'leaf-cov':>8s}"
     print(header)
     print("-" * len(header))
 
@@ -182,19 +176,18 @@ def run() -> None:
         )
         embeddings = compute_leaf_embeddings(substrate.crops, clip) if clip is not None else {}
 
-        for v in variants:
-            built_l2i, _forests, _ground = build_initial_leaf2inst(substrate, embeddings, configs[v])
-            m = _initial_metrics(built_l2i, ship_l2i)
-            leaves_col = f"{m['leaves_built']}/{m['leaves_shipped']}"
-            inst_col = f"{m['inst_built']}/{m['inst_shipped']}"
-            perfect_col = f"{m['IoU_perfect']}/{m['inst_built']}"
-            print(
-                f"{seq.name:16s} {v:9s} {leaves_col:12s} {inst_col:10s} "
-                f"{m['ARI']:6.3f} {m['IoU_mean']:6.3f} {perfect_col:>8s} {m['leaf_cov']:8.3f}"
-            )
-            csv_rows.append({"sequence": seq.name, "variant": v, **m})
+        built_l2i, _forests, _ground = build_initial_leaf2inst(substrate, embeddings, PAPER)
+        m = _initial_metrics(built_l2i, ship_l2i)
+        leaves_col = f"{m['leaves_built']}/{m['leaves_shipped']}"
+        inst_col = f"{m['inst_built']}/{m['inst_shipped']}"
+        perfect_col = f"{m['IoU_perfect']}/{m['inst_built']}"
+        print(
+            f"{seq.name:16s} {leaves_col:12s} {inst_col:10s} "
+            f"{m['ARI']:6.3f} {m['IoU_mean']:6.3f} {perfect_col:>8s} {m['leaf_cov']:8.3f}"
+        )
+        csv_rows.append({"sequence": seq.name, **m})
 
-        upd_rows = _update_metrics(seq / "data", shipped, configs[variants[0]].containment_thresh)
+        upd_rows = _update_metrics(seq / "data", shipped, PAPER.containment_thresh)
         for ur in upd_rows:
             print(
                 f"  update frame {ur['frame']}: leaves(b/s)={ur['leaves_built']}/{ur['leaves_shipped']} "

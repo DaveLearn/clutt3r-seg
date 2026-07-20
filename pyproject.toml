@@ -90,10 +90,6 @@ env = { DUODUOCLIP_ROOT = "$PIXI_PROJECT_ROOT/external/DuoduoCLIP" }
 setup_duoduo_clip = "bash scripts/setup_duoduo_clip.sh external/DuoduoCLIP"
 # deg external-segmenter entry point (transforms.json + scene.pkl -> objects).
 segment_external = "python segment.py"
-# Reconstruct data/instance_tree.json from the paper (the release omits the builder).
-build_tree = "python build_tree.py"
-# Generate Grounded-SAM instance masks (the release omits the detector too).
-generate_masks = "python generate_masks.py"
 # Native upstream entry points (useful for sample-sequence validation).
 run_initial = "bash scripts/run_initial.sh"
 run_update = "bash scripts/run_update.sh"

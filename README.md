@@ -159,31 +159,22 @@ constituent pairs) in two stages — first by super-voxel spatial similarity
 
 ### Building a tree
 
-```bash
-# writes <seq>/data/instance_tree.json
-pixi run build_tree samples/sample_seq2 --initial-idx 0,1,2,3,4,5,6,7 --update-idx 8,9
-```
-
 `segment.py` auto-builds the tree when it is missing (`--build-tree-if-missing`,
-on by default), so a sequence with RGB-D + poses no longer needs a precomputed
-artifact.
+on by default), writing `<seq>/data/instance_tree.json`, so a sequence with RGB-D
++ poses no longer needs a precomputed artifact.
 
 ### Mask generation (Grounded-SAM)
 
 The release expects `data/instance_masks/` to already exist but ships no detector.
 We reconstruct the paper's front-end — **Grounded-SAM** (GroundingDINO + SAM,
 prompt `object`) via HuggingFace `transformers` — in
-`clutt3rseg/mask_backends/grounded_sam.py`:
+`clutt3rseg/mask_backends/grounded_sam.py`.
 
-```bash
-# writes <seq>/data/instance_masks/mask_<frame>_<inst>.png (downloads checkpoints first run)
-pixi run generate_masks samples/sample_seq2 --frames 0,1,2,3,4,5,6,7
-```
-
-`segment.py` also auto-generates masks when `data/instance_masks/` is absent
-(`--generate-masks-if-missing`, on by default). With this, the full pipeline runs
-from RGB + depth + poses alone: missing masks → Grounded-SAM, missing tree →
-builder, then the segmenter.
+`segment.py` auto-generates masks when `data/instance_masks/` is absent
+(`--generate-masks-if-missing`, on by default), writing
+`<seq>/data/instance_masks/mask_<frame>_<inst>.png` (downloads checkpoints on the
+first run). With this, the full pipeline runs from RGB + depth + poses alone:
+missing masks → Grounded-SAM, missing tree → builder, then the segmenter.
 
 ### Measured (non-dense) depth
 
@@ -253,65 +244,33 @@ for deg datasets — matching the point resolution the other baselines use (SAM3
 voxelises at 0.0035 m; MaskClustering/Open3DIS/SAI3D mesh at a 0.004 m TSDF voxel)
 — and 0.005 m for the native samples (keeps the shipped-tree reproduction exact).
 
-### Grouping variant flag
-
-`build_tree.py` and `segment.py` take `--variant {paper,improved}`. Both use the
-same Algorithm-1 machinery (complete cross-frame leaf graph, two-stage greedy
-contraction, **average linkage**, residual substitution); they differ only in the
-spatial-similarity term and its threshold:
-
-| variant           | spatial term                    | `tau_spat` | `tau_sem` | linkage |
-| ----------------- | ------------------------------- | ---------- | --------- | ------- |
-| `paper` (default) | weighted Jaccard (∩/∪)          | 0.50       | 0.65      | average |
-| `improved`        | weighted overlap coeff. (∩/min) | 0.40       | 0.65      | average |
-
-`paper` is the literal method section and is the default. `improved` makes one principled change: the
-spatial term divides by the smaller mask's mass instead of the union (overlap
-coefficient). Rationale (see `_pair_spatial`): a partial cross-view mask of an
-object overlaps only ~0.5 of the accumulated object under Jaccard and can miss
-`tau_spat`, whereas distinct objects share ~0 fine 5 mm super-voxels
-(inter-instance overlap p90 < 0.01), so the overlap coefficient raises recall
-without hurting precision. Individual knobs override the variant: `--spatial-metric`,
-`--tau-spat`, `--tau-sem`, `--linkage`, `--containment-thresh`.
-
 ### Reproducing the shipped trees
 
 `scripts/reproduce_sample_trees.py` rebuilds every bundled sample from its raw
 data and compares to the shipped artifact:
 
 ```bash
-pixi run --frozen python scripts/reproduce_sample_trees.py --variants paper,improved
+pixi run --frozen python scripts/reproduce_sample_trees.py
 ```
 
 Agreement with the shipped `instance_tree.json` — Adjusted Rand Index (ARI) of the
 two groupings on shared leaves, mean best-match instance IoU, instance counts
 (built/shipped), and the fraction of shipped leaf masks recovered (leaf-cov):
 
-| sequence    | variant      | ARI       | mean IoU  | inst (built/shipped) | leaf-cov |
-| ----------- | ------------ | --------- | --------- | -------------------- | -------- |
-| sample_seq1 | paper        | 1.000     | 1.000     | 9/10                 | 0.95     |
-| sample_seq2 | paper        | 0.883     | 0.690     | 15/10                | 0.97     |
-| sample_seq3 | paper        | 0.929     | 0.809     | 31/27                | 0.93     |
-| sample_seq4 | paper        | 0.935     | 0.943     | 13/15                | 0.91     |
-| sample_seq5 | paper        | 0.806     | 0.571     | 16/8                 | 0.98     |
-| **mean**    | **paper**    | **0.911** | **0.803** | —                    | **0.95** |
-| sample_seq1 | improved     | 1.000     | 1.000     | 9/10                 | 0.95     |
-| sample_seq2 | improved     | 0.981     | 0.950     | 10/10                | 0.97     |
-| sample_seq3 | improved     | 0.941     | 0.928     | 24/27                | 0.93     |
-| sample_seq4 | improved     | 0.935     | 0.943     | 13/15                | 0.91     |
-| sample_seq5 | improved     | 0.973     | 0.938     | 9/8                  | 0.98     |
-| **mean**    | **improved** | **0.966** | **0.952** | —                    | **0.95** |
+| sequence    | ARI       | mean IoU  | inst (built/shipped) | leaf-cov |
+| ----------- | --------- | --------- | -------------------- | -------- |
+| sample_seq1 | 1.000     | 1.000     | 9/10                 | 0.95     |
+| sample_seq2 | 0.883     | 0.690     | 15/10                | 0.97     |
+| sample_seq3 | 0.929     | 0.809     | 31/27                | 0.93     |
+| sample_seq4 | 0.935     | 0.943     | 13/15                | 0.91     |
+| sample_seq5 | 0.806     | 0.571     | 16/8                 | 0.98     |
+| **mean**    | **0.911** | **0.803** | —                    | **0.95** |
 
 The faithful `paper` method already reproduces the released trees well (mean ARI
 ≈ 0.91; perfect on seq1). Its main residual error is mild **over-segmentation**:
 weighted-Jaccard@0.5 occasionally leaves a partial cross-view mask just below the
 threshold, so an object splits into two instances (seq2 15 vs 10, seq5 16 vs 8 —
 the downstream consumer's min-size filter removes most of these small fragments).
-The optional `improved` overlap-coefficient term closes that gap (instance counts
-and IoU much closer to the release; mean ARI ≈ 0.97), but it is a small recall
-tweak on top of a faithful, already-correct reproduction — not a different method.
-The **default is `paper`** so the baseline matches the publication; pass
-`--variant improved` for the higher-recall variant.
 
 For the update frames the per-frame containment **leaf sets** match the shipped
 trees exactly (leaf Jaccard = 1.0 on seq1/seq2); only the count of internal

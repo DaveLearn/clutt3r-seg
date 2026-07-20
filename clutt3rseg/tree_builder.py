@@ -67,37 +67,22 @@ class GroupingConfig:
     edge to a neighbour is the mean similarity over all constituent pairs
     (GroupAndRewire, lines 32-35).
 
-    Two presets are provided (see :data:`PAPER` and :data:`IMPROVED`):
-
-    * ``paper`` (default) -- the literal method section: spatial term is the
-      super-voxel **weighted Jaccard** (intersection-over-union), ``tau_spat=0.5``,
-      ``tau_sem=0.65``, average linkage.
-    * ``improved`` -- identical except the spatial term is the weighted **overlap
-      coefficient** (intersection-over-min) with ``tau_spat=0.4``, which improves
-      recall on partial cross-view masks (see :func:`_pair_spatial`).
-
-    The bare ``GroupingConfig()`` defaults are the ``paper`` values.
+    The single ``paper`` preset (see :data:`PAPER`) is the literal method section:
+    the spatial term is the super-voxel **weighted Jaccard** (intersection-over-
+    union), ``tau_spat=0.5``, ``tau_sem=0.65``, average linkage. The bare
+    ``GroupingConfig()`` defaults are those values.
     """
 
-    spatial_metric: str = "jaccard"  # "jaccard" (paper) | "overlap" (improved)
     tau_spat: float = 0.5
     tau_sem: float = TAU_SEMANTIC
-    linkage: str = "average"  # "average" (paper, mean over constituent pairs) | "max"
+    linkage: str = "average"  # mean similarity over constituent pairs (Lance-Williams)
     containment_thresh: float = CONTAINMENT_THRESH
 
 
 PAPER = GroupingConfig()
-IMPROVED = GroupingConfig(spatial_metric="overlap", tau_spat=0.4)
 
 # Backwards-compatible module-level default (the paper spatial acceptance).
 TAU_SPATIAL = PAPER.tau_spat
-
-
-def resolve_variant(name: str) -> GroupingConfig:
-    presets = {"paper": PAPER, "improved": IMPROVED}
-    if name not in presets:
-        raise ValueError(f"Unknown grouping variant '{name}'. Choose one of {sorted(presets)}.")
-    return presets[name]
 
 
 # --------------------------------------------------------------------------- #
@@ -152,30 +137,19 @@ def build_containment_forest(
 # Grouping (paper Algorithm 1: agglomerative average-linkage on a cross-frame
 # leaf graph, spatial stage then semantic stage)
 # --------------------------------------------------------------------------- #
-def _pair_spatial(occ_a: dict[int, float], occ_b: dict[int, float], counts_per_sp: np.ndarray, metric: str) -> float:
+def _pair_spatial(occ_a: dict[int, float], occ_b: dict[int, float], counts_per_sp: np.ndarray) -> float:
     """Weighted super-voxel spatial similarity between two leaf masks, occupancy capped at 1.
 
-    ``metric="jaccard"`` is the paper's term, intersection-over-**union**.
-    ``metric="overlap"`` is the overlap coefficient, intersection-over-**min**.
-
-    Under a strict Jaccard each view of an object covers only the super-voxels it
-    can see, so two single-view masks of the same object overlap ~0.5 at best;
-    distinct objects share ~0 fine 5 mm super-voxels (measured inter-instance
-    overlap p90 < 0.01). Dividing by the smaller mask's mass (overlap coefficient)
-    instead of the union improves recall on partial cross-view masks while keeping
-    that precision.
+    This is the paper's term: the weighted **Jaccard**, intersection-over-**union**.
     """
-    inter = mass_a = mass_b = union = 0.0
+    inter = union = 0.0
     for k in set(occ_a) | set(occ_b):
         cap = counts_per_sp[k]
         oa = min(1.0, occ_a.get(k, 0.0) / cap)
         ob = min(1.0, occ_b.get(k, 0.0) / cap)
         inter += cap * min(oa, ob)
-        mass_a += cap * oa
-        mass_b += cap * ob
         union += cap * max(oa, ob)
-    denom = union if metric == "jaccard" else min(mass_a, mass_b)
-    return inter / (denom + 1e-8) if denom > 0 else 0.0
+    return inter / (union + 1e-8) if union > 0 else 0.0
 
 
 def _agglomerate(
@@ -319,7 +293,7 @@ def build_initial_leaf2inst(
         for j in range(i + 1, len(leaves)):
             if leaves[i][0] == leaves[j][0]:
                 continue  # same frame -> no edge
-            spat_edges[(i, j)] = _pair_spatial(occ_of[leaves[i]], occ_of[leaves[j]], counts_per_sp, config.spatial_metric)
+            spat_edges[(i, j)] = _pair_spatial(occ_of[leaves[i]], occ_of[leaves[j]], counts_per_sp)
             ei, ej = embeddings.get(leaves[i]), embeddings.get(leaves[j])
             sem_edges[(i, j)] = float(np.dot(ei, ej)) if ei is not None and ej is not None else -1.0
 
@@ -338,8 +312,8 @@ def build_initial_leaf2inst(
     leaf2inst = {leaf: order[cid] for leaf, cid in leaf2cluster.items()}
 
     logger.info(
-        "Grouping[%s/%s]: %d leaves -> %d instances (spatial=%d, semantic=%d, residual-fold=%d)",
-        config.spatial_metric, config.linkage, len(leaves), len(set(leaf2inst.values())),
+        "Grouping[jaccard/%s]: %d leaves -> %d instances (spatial=%d, semantic=%d, residual-fold=%d)",
+        config.linkage, len(leaves), len(set(leaf2inst.values())),
         counts["spatial"], counts["semantic"], n_fold,
     )
     return leaf2inst, forests, ground_leaves
@@ -457,7 +431,7 @@ def build_instance_tree_artifact(
         "schema_version": 1,
         "source": (
             "Instance-tree artifact reconstructed by clutt3rseg.tree_builder "
-            f"(paper arXiv:2602.11660), grouping: spatial={config.spatial_metric} "
+            f"(paper arXiv:2602.11660), grouping: spatial=jaccard "
             f"tau_spat={config.tau_spat} tau_sem={config.tau_sem} linkage={config.linkage}."
         ),
         "initial": initial,
