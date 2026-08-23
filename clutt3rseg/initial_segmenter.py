@@ -30,6 +30,26 @@ def _print_stage(step: int, message: str) -> None:
     print(f"[initial {step}/{TOTAL_STAGES}] {message}", flush=True)
 
 
+def _empty_initial_data() -> dict:
+    """Return a valid initial state for a sequence with no detected instances."""
+    return {
+        "instance_embeddings": {},
+        "mean_ground_embedding": None,
+        "inst_colors_u8": np.empty((0, 3), dtype=np.uint8),
+        "node2inst": {},
+        "instance_pcds": {},
+        "original_data": {"inst2all_points": {}},
+    }
+
+
+def _has_initial_masks(instance_mask_path: Path, initial_idx: list[int]) -> bool:
+    """Whether any requested initial frame has a Grounded-SAM mask artifact."""
+    return any(
+        next(instance_mask_path.glob(f"mask_{int(fidx):06d}_*.png"), None) is not None
+        for fidx in initial_idx
+    )
+
+
 def validate_initial_dataset(args) -> None:
     data_dir = Path(args.experiment_data_dir) / "data"
     transforms_path = data_dir / "transforms.json"
@@ -86,8 +106,15 @@ def validate_initial_dataset(args) -> None:
 
 
 def initial_segmentation_consistency(args, clip, device = "cuda"):
-    _print_stage(3, "Building initial geometry and superpoints")
     initial_scene_root = Path(args.experiment_data_dir) / "data"
+    instance_mask_path = initial_scene_root / "instance_masks"
+    # Empty individual views are expected. Only short-circuit when the complete
+    # requested initial camera set produced no masks at all.
+    if not _has_initial_masks(instance_mask_path, args.initial_idx):
+        _print_stage(3, "No initial instance masks; returning an empty segmentation")
+        return _empty_initial_data()
+
+    _print_stage(3, "Building initial geometry and superpoints")
     meta = json.load(open(initial_scene_root / "transforms.json"))
     frames_meta = meta["frames"]
     # Intrinsics are resolved per frame (K_from_meta prefers a per-frame "K" and
@@ -108,7 +135,7 @@ def initial_segmentation_consistency(args, clip, device = "cuda"):
 
     raw_images = {}
     output_dir = args.experiment_data_dir / "output"
-    instance_mask_path = args.experiment_data_dir / "data" / "instance_masks"
+    instance_mask_path = initial_scene_root / "instance_masks"
 
     for local_idx, fr in enumerate(initial_frames_meta):
 
